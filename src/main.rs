@@ -157,6 +157,141 @@ fn default_config() -> Config {
     }
 }
 
+/// Parse a toggle value that may be a JSON bool, number, or string like
+/// "1"/"true". Unparseable garbage (e.g. "1t") yields None so callers fall
+/// back to a default instead of panicking.
+fn parse_toggle(v: Option<&serde_json::Value>) -> Option<bool> {
+    match v? {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::Number(n) => n.as_i64().map(|n| n != 0),
+        serde_json::Value::String(s) => {
+            let t = s.trim().to_ascii_lowercase();
+            match t.as_str() {
+                "1" | "true" | "yes" | "y" | "on" => Some(true),
+                "0" | "false" | "no" | "n" | "off" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Parse a score value that may be a JSON number or string like "1"/"-5".
+fn parse_score(v: Option<&serde_json::Value>) -> Option<i64> {
+    match v? {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            t.parse::<i64>()
+                .ok()
+                .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
+        }
+        serde_json::Value::Bool(b) => Some(i64::from(*b)),
+        _ => None,
+    }
+}
+
+/// Parse an interval value that may be a JSON number or string.
+fn parse_u64(v: Option<&serde_json::Value>) -> Option<u64> {
+    match v? {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok())),
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            t.parse::<u64>()
+                .ok()
+                .or_else(|| t.parse::<i64>().ok().and_then(|i| u64::try_from(i).ok()))
+        }
+        _ => None,
+    }
+}
+
+/// Overlay the engine's flat module_specific credential keys onto a Config,
+/// falling back to the given legacy values for any key that is absent or
+/// unparseable.
+fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_json::Value>) -> Config {
+    macro_rules! apply_rule {
+        ($field:ident, $prefix:literal) => {
+            if let Some(t) = parse_toggle(ms.get(concat!($prefix, "_toggle"))) {
+                cfg.$field.toggle = t;
+            }
+            if let Some(s) = parse_score(ms.get(concat!($prefix, "_score"))) {
+                cfg.$field.score = s;
+            }
+        };
+    }
+    apply_rule!(punctuation, "punctuation");
+    apply_rule!(question, "question");
+    apply_rule!(length, "length");
+    apply_rule!(spam, "spam");
+    apply_rule!(no_spacing, "no_spacing");
+    apply_rule!(wordless, "wordless");
+    apply_rule!(emoji, "emoji");
+    apply_rule!(frequency, "frequency");
+    if let Some(i) = parse_u64(ms.get("frequency_interval_secs")) {
+        cfg.frequency.interval_secs = i;
+    }
+    cfg
+}
+
+/// Build the flat module_specific map for a Config, preferring values already
+/// present (and parseable) in the existing module_specific object, then
+/// migrating legacy top-level nested values, then falling back to the given
+/// Config.
+fn flat_map_for_write(
+    cfg: &Config,
+    root: &serde_json::Value,
+    ms: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    macro_rules! put_rule {
+        ($field:ident, $prefix:literal) => {
+            let toggle_key = concat!($prefix, "_toggle");
+            let score_key = concat!($prefix, "_score");
+            let legacy = root.get($prefix).and_then(|r| r.as_object());
+            let toggle = parse_toggle(ms.get(toggle_key))
+                .or_else(|| legacy.and_then(|l| parse_toggle(l.get("toggle"))))
+                .unwrap_or(cfg.$field.toggle);
+            let score = parse_score(ms.get(score_key))
+                .or_else(|| legacy.and_then(|l| parse_score(l.get("score"))))
+                .unwrap_or(cfg.$field.score);
+            out.insert(toggle_key.to_string(), serde_json::Value::Bool(toggle));
+            out.insert(score_key.to_string(), serde_json::json!(score));
+        };
+    }
+    put_rule!(punctuation, "punctuation");
+    put_rule!(question, "question");
+    put_rule!(length, "length");
+    put_rule!(spam, "spam");
+    put_rule!(no_spacing, "no_spacing");
+    put_rule!(wordless, "wordless");
+    put_rule!(emoji, "emoji");
+    put_rule!(frequency, "frequency");
+    let interval = parse_u64(ms.get("frequency_interval_secs")).unwrap_or(cfg.frequency.interval_secs);
+    out.insert("frequency_interval_secs".to_string(), serde_json::json!(interval));
+    out
+}
+
+/// Write config under the module_specific object using the flat credential
+/// keys, preserving the rest of the file (connection fields etc.) and
+/// migrating any legacy top-level nested values into the flat keys.
+fn write_config(cfg: &Config) {
+    let mut root: serde_json::Value = std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let ms = root
+        .get("module_specific")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    root["module_specific"] = serde_json::Value::Object(flat_map_for_write(cfg, &root, &ms));
+    if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+        let _ = std::fs::write("config.json", pretty);
+    }
+}
+
 async fn load_config(
     write_ws: &Arc<AsyncMutex<WsWriteHalf>>,
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
@@ -165,8 +300,19 @@ async fn load_config(
     instance_uuid: &str,
 ) -> Config {
     if let Ok(s) = std::fs::read_to_string("config.json") {
-        if let Ok(cfg) = serde_json::from_str(&s) {
-            return cfg;
+        if let Ok(root) = serde_json::from_str::<serde_json::Value>(&s) {
+            // The engine stores this module's non-sensitive credential
+            // settings under module_specific, keyed by the flat credential
+            // keys. Map those onto the nested Config structure.
+            if let Some(ms) = root.get("module_specific").and_then(|v| v.as_object()) {
+                let legacy = serde_json::from_value::<Config>(root.clone())
+                    .unwrap_or_else(|_| default_config());
+                return apply_flat_overlay(legacy, ms);
+            }
+            // Legacy layouts stored the nested Config at the top level.
+            if let Ok(cfg) = serde_json::from_value::<Config>(root) {
+                return cfg;
+            }
         }
     }
 
@@ -210,9 +356,7 @@ async fn load_config(
         .map(|c| c.trim().eq_ignore_ascii_case("y") || c.trim().eq_ignore_ascii_case("yes"))
         .unwrap_or(default.frequency.toggle);
 
-    if let Ok(pretty) = serde_json::to_string_pretty(&default) {
-        let _ = std::fs::write("config.json", pretty);
-    }
+    write_config(&default);
     default
 }
 

@@ -594,3 +594,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_off() -> Config {
+        let mut c = default_config();
+        for r in [&mut c.punctuation, &mut c.question, &mut c.length, &mut c.spam, &mut c.no_spacing, &mut c.wordless, &mut c.emoji] {
+            r.toggle = false;
+        }
+        c
+    }
+
+    #[test]
+    fn punctuation_rewarded() {
+        let c = all_off();
+        let (delta, notes) = score_message("hello there", &c);
+        assert_eq!(delta, 0);
+        let mut c2 = c.clone();
+        c2.punctuation.toggle = true;
+        let (delta, notes) = score_message("hello there!", &c2);
+        assert_eq!(delta, 1);
+        assert!(notes.contains(&"punctuation".to_string()));
+    }
+
+    #[test]
+    fn question_rewarded() {
+        let mut c = all_off();
+        c.question.toggle = true;
+        let (delta, notes) = score_message("are you ok?", &c);
+        assert_eq!(delta, 2);
+        assert!(notes.contains(&"question".to_string()));
+    }
+
+    #[test]
+    fn length_rewarded_over_40() {
+        let mut c = all_off();
+        c.length.toggle = true;
+        let long = "this is a fairly long message that definitely exceeds forty characters by a bit";
+        let (delta, _) = score_message(long, &c);
+        assert_eq!(delta, 1);
+        let (delta, _) = score_message("short", &c);
+        assert_eq!(delta, 0);
+    }
+
+    #[test]
+    fn spam_punished() {
+        let mut c = all_off();
+        c.spam.toggle = true;
+        let (delta, notes) = score_message("aaaaaaa llllllll oooooooo", &c);
+        assert_eq!(delta, -5);
+        assert!(notes.contains(&"spam".to_string()));
+    }
+
+    #[test]
+    fn emoji_rewarded() {
+        let mut c = all_off();
+        c.emoji.toggle = true;
+        let (delta, _) = score_message("nice stream 👍", &c);
+        assert_eq!(delta, 1);
+    }
+
+    #[test]
+    fn wordless_punished() {
+        let mut c = all_off();
+        c.wordless.toggle = true;
+        let (delta, _) = score_message("tr th s", &c);
+        assert_eq!(delta, -3);
+    }
+}

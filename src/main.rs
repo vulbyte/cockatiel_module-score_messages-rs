@@ -70,6 +70,66 @@ struct Config {
     emoji: Rule,
     #[serde(default)]
     frequency: FrequencyRule,
+    #[serde(default = "default_length_min_chars")]
+    length_min_chars: i64,
+    #[serde(default = "default_no_spacing_min_len")]
+    no_spacing_min_len: i64,
+    #[serde(default = "default_spam_min_token_len")]
+    spam_min_token_len: i64,
+    #[serde(default = "default_keyboard_mash_min_len")]
+    keyboard_mash_min_len: i64,
+    #[serde(default = "default_wordless_vowel_ratio")]
+    wordless_vowel_ratio: f64,
+    #[serde(default = "default_frequency_interval_floor_secs")]
+    frequency_interval_floor_secs: u64,
+    #[serde(default = "default_last_msg_cap")]
+    last_msg_cap: usize,
+    #[serde(default = "default_prompt_timeout_secs")]
+    prompt_timeout_secs: u32,
+    #[serde(default = "default_reconnect_base_secs")]
+    reconnect_base_secs: u64,
+    #[serde(default = "default_reconnect_max_secs")]
+    reconnect_max_secs: u64,
+}
+
+fn default_length_min_chars() -> i64 {
+    40
+}
+
+fn default_no_spacing_min_len() -> i64 {
+    20
+}
+
+fn default_spam_min_token_len() -> i64 {
+    4
+}
+
+fn default_keyboard_mash_min_len() -> i64 {
+    5
+}
+
+fn default_wordless_vowel_ratio() -> f64 {
+    0.5
+}
+
+fn default_frequency_interval_floor_secs() -> u64 {
+    1
+}
+
+fn default_last_msg_cap() -> usize {
+    10_000
+}
+
+fn default_prompt_timeout_secs() -> u32 {
+    60
+}
+
+fn default_reconnect_base_secs() -> u64 {
+    1
+}
+
+fn default_reconnect_max_secs() -> u64 {
+    30
 }
 
 /// Send a Prompt to the engine (forwarded to connected UIs) and wait for the
@@ -154,6 +214,16 @@ fn default_config() -> Config {
         wordless: Rule { toggle: true, score: -3 },
         emoji: Rule { toggle: true, score: 1 },
         frequency: FrequencyRule::default(),
+        length_min_chars: default_length_min_chars(),
+        no_spacing_min_len: default_no_spacing_min_len(),
+        spam_min_token_len: default_spam_min_token_len(),
+        keyboard_mash_min_len: default_keyboard_mash_min_len(),
+        wordless_vowel_ratio: default_wordless_vowel_ratio(),
+        frequency_interval_floor_secs: default_frequency_interval_floor_secs(),
+        last_msg_cap: default_last_msg_cap(),
+        prompt_timeout_secs: default_prompt_timeout_secs(),
+        reconnect_base_secs: default_reconnect_base_secs(),
+        reconnect_max_secs: default_reconnect_max_secs(),
     }
 }
 
@@ -207,6 +277,25 @@ fn parse_u64(v: Option<&serde_json::Value>) -> Option<u64> {
     }
 }
 
+/// Parse an f64 value that may be a JSON number or string.
+fn parse_f64(v: Option<&serde_json::Value>) -> Option<f64> {
+    match v? {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Parse a usize value that may be a JSON number or string.
+fn parse_usize(v: Option<&serde_json::Value>) -> Option<usize> {
+    parse_u64(v).and_then(|u| usize::try_from(u).ok())
+}
+
+/// Parse a u32 value that may be a JSON number or string.
+fn parse_u32(v: Option<&serde_json::Value>) -> Option<u32> {
+    parse_u64(v).and_then(|u| u32::try_from(u).ok())
+}
+
 /// Overlay the engine's flat module_specific credential keys onto a Config,
 /// falling back to the given legacy values for any key that is absent or
 /// unparseable.
@@ -231,6 +320,36 @@ fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_json::
     apply_rule!(frequency, "frequency");
     if let Some(i) = parse_u64(ms.get("frequency_interval_secs")) {
         cfg.frequency.interval_secs = i;
+    }
+    if let Some(v) = parse_score(ms.get("length_min_chars")) {
+        cfg.length_min_chars = v;
+    }
+    if let Some(v) = parse_score(ms.get("no_spacing_min_len")) {
+        cfg.no_spacing_min_len = v;
+    }
+    if let Some(v) = parse_score(ms.get("spam_min_token_len")) {
+        cfg.spam_min_token_len = v;
+    }
+    if let Some(v) = parse_score(ms.get("keyboard_mash_min_len")) {
+        cfg.keyboard_mash_min_len = v;
+    }
+    if let Some(v) = parse_f64(ms.get("wordless_vowel_ratio")) {
+        cfg.wordless_vowel_ratio = v;
+    }
+    if let Some(v) = parse_u64(ms.get("frequency_interval_floor_secs")) {
+        cfg.frequency_interval_floor_secs = v;
+    }
+    if let Some(v) = parse_usize(ms.get("last_msg_cap")) {
+        cfg.last_msg_cap = v;
+    }
+    if let Some(v) = parse_u32(ms.get("prompt_timeout_secs")) {
+        cfg.prompt_timeout_secs = v;
+    }
+    if let Some(v) = parse_u64(ms.get("reconnect_base_secs")) {
+        cfg.reconnect_base_secs = v;
+    }
+    if let Some(v) = parse_u64(ms.get("reconnect_max_secs")) {
+        cfg.reconnect_max_secs = v;
     }
     cfg
 }
@@ -270,6 +389,26 @@ fn flat_map_for_write(
     put_rule!(frequency, "frequency");
     let interval = parse_u64(ms.get("frequency_interval_secs")).unwrap_or(cfg.frequency.interval_secs);
     out.insert("frequency_interval_secs".to_string(), serde_json::json!(interval));
+    macro_rules! put_scalar {
+        ($key:literal, $parse:ident, $cfg_val:expr) => {{
+            let v = $parse(ms.get($key)).unwrap_or($cfg_val);
+            out.insert($key.to_string(), serde_json::json!(v));
+        }};
+    }
+    put_scalar!("length_min_chars", parse_score, cfg.length_min_chars);
+    put_scalar!("no_spacing_min_len", parse_score, cfg.no_spacing_min_len);
+    put_scalar!("spam_min_token_len", parse_score, cfg.spam_min_token_len);
+    put_scalar!("keyboard_mash_min_len", parse_score, cfg.keyboard_mash_min_len);
+    put_scalar!("wordless_vowel_ratio", parse_f64, cfg.wordless_vowel_ratio);
+    put_scalar!(
+        "frequency_interval_floor_secs",
+        parse_u64,
+        cfg.frequency_interval_floor_secs
+    );
+    put_scalar!("last_msg_cap", parse_usize, cfg.last_msg_cap);
+    put_scalar!("prompt_timeout_secs", parse_u32, cfg.prompt_timeout_secs);
+    put_scalar!("reconnect_base_secs", parse_u64, cfg.reconnect_base_secs);
+    put_scalar!("reconnect_max_secs", parse_u64, cfg.reconnect_max_secs);
     out
 }
 
@@ -328,7 +467,7 @@ async fn load_config(
         "No saved config was found. Enable the emoji rule (reward messages containing emoji)?",
         "Enable emoji rule? (y/n)",
         PromptKind::Boolean,
-        60,
+        default_config().prompt_timeout_secs,
     )
     .await;
 
@@ -342,7 +481,7 @@ async fn load_config(
         "Enable the frequency rule (punish users who post again too soon)?",
         "Enable frequency rule? (y/n)",
         PromptKind::Boolean,
-        60,
+        default_config().prompt_timeout_secs,
     )
     .await;
 
@@ -361,9 +500,9 @@ async fn load_config(
 }
 
 /// Is this token made of repeated characters (spam: bbbbb, asdlfkjsqaldkfja)?
-fn looks_like_spam_token(token: &str) -> bool {
+fn looks_like_spam_token(token: &str, min_token_len: i64, mash_min_len: i64) -> bool {
     let t = token.to_lowercase();
-    if t.len() < 4 {
+    if (t.len() as i64) < min_token_len {
         return false;
     }
     let chars: Vec<char> = t.chars().collect();
@@ -373,10 +512,10 @@ fn looks_like_spam_token(token: &str) -> bool {
         return true;
     }
     let has_vowel = chars.iter().any(|c| "aeiou".contains(*c));
-    !has_vowel && t.len() >= 5
+    !has_vowel && (t.len() as i64) >= mash_min_len
 }
 
-fn is_wordless(message: &str) -> bool {
+fn is_wordless(message: &str, vowel_ratio: f64) -> bool {
     // Uses a crude trigram check: if most tokens contain no vowels, treat as wordless.
     let tokens: Vec<&str> = message.split_whitespace().collect();
     if tokens.is_empty() {
@@ -386,7 +525,7 @@ fn is_wordless(message: &str) -> bool {
         .iter()
         .filter(|t| t.chars().any(|c| "aeiou".contains(c.to_ascii_lowercase())))
         .count();
-    (wordlike as f64 / tokens.len() as f64) < 0.5
+    (wordlike as f64 / tokens.len() as f64) < vowel_ratio
 }
 
 /// Common emoji Unicode ranges.
@@ -477,15 +616,17 @@ fn score_message(message: &str, cfg: &Config) -> (i64, Vec<String>) {
         notes.push("question".into());
     }
 
-    // Length: reward for substantial messages (>= 40 chars).
-    if cfg.length.toggle && trimmed.chars().count() >= 40 {
+    // Length: reward for substantial messages (>= length_min_chars).
+    if cfg.length.toggle && (trimmed.chars().count() as i64) >= cfg.length_min_chars {
         delta += cfg.length.score;
         notes.push("length".into());
     }
 
     // Spam: repeated-char tokens / keyboard mash.
     if cfg.spam.toggle {
-        let spam = trimmed.split_whitespace().any(looks_like_spam_token);
+        let spam = trimmed.split_whitespace().any(|tok| {
+            looks_like_spam_token(tok, cfg.spam_min_token_len, cfg.keyboard_mash_min_len)
+        });
         if spam {
             delta += cfg.spam.score;
             notes.push("spam".into());
@@ -496,14 +637,14 @@ fn score_message(message: &str, cfg: &Config) -> (i64, Vec<String>) {
     if cfg.no_spacing.toggle {
         let len = trimmed.chars().count();
         let spaces = trimmed.chars().filter(|c| *c == ' ').count();
-        if len >= 20 && spaces == 0 {
+        if (len as i64) >= cfg.no_spacing_min_len && spaces == 0 {
             delta += cfg.no_spacing.score;
             notes.push("no_spacing".into());
         }
     }
 
     // Wordless: mostly vowel-less tokens.
-    if cfg.wordless.toggle && is_wordless(trimmed) {
+    if cfg.wordless.toggle && is_wordless(trimmed, cfg.wordless_vowel_ratio) {
         delta += cfg.wordless.score;
         notes.push("wordless".into());
     }
@@ -632,8 +773,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Frequency: punish posting again too soon after the last message.
                             if config.frequency.toggle && !user_id.is_empty() {
                                 let now = Instant::now();
-                                let interval =
-                                    Duration::from_secs(config.frequency.interval_secs.max(1));
+                                let interval = Duration::from_secs(
+                                    config
+                                        .frequency
+                                        .interval_secs
+                                        .max(config.frequency_interval_floor_secs),
+                                );
                                 if let Some(prev) = last_msg.get(&user_id) {
                                     if now.duration_since(*prev) < interval {
                                         delta += config.frequency.score;
@@ -645,7 +790,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // than the interval, then oldest-first if the
                                 // map still exceeds the size cap.
                                 last_msg.retain(|_, t| now.duration_since(*t) < interval);
-                                if last_msg.len() >= 10_000 {
+                                if last_msg.len() >= config.last_msg_cap {
                                     if let Some(evict) = last_msg
                                         .iter()
                                         .min_by_key(|(_, t)| **t)
@@ -722,7 +867,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // The engine connection dropped — reconnect with backoff instead
                 // of leaving the module unresponsive.
                 info!("Engine disconnected — reconnecting...");
-                let mut backoff = 1u64;
+                let reconnect_cfg = config_shared.lock().unwrap().clone();
+                let mut backoff = reconnect_cfg.reconnect_base_secs;
                 loop {
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                     match CockatielClient::connect("config.json").await {
@@ -738,7 +884,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(e) => {
                             warn!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
-                            backoff = (backoff * 2).min(30);
+                            backoff = (backoff * 2).min(reconnect_cfg.reconnect_max_secs);
                         }
                     }
                 }
@@ -829,6 +975,63 @@ mod tests {
         c.wordless.toggle = true;
         let (delta, _) = score_message("tr th s", &c);
         assert_eq!(delta, -3);
+    }
+
+    #[test]
+    fn flat_overlay_round_trips_new_tunables() {
+        let cfg = default_config();
+        let root = serde_json::json!({});
+        let written = flat_map_for_write(&cfg, &root, &serde_json::Map::new());
+        // Defaults are written back for every new tunable key.
+        assert_eq!(written["length_min_chars"], 40);
+        assert_eq!(written["no_spacing_min_len"], 20);
+        assert_eq!(written["spam_min_token_len"], 4);
+        assert_eq!(written["keyboard_mash_min_len"], 5);
+        assert_eq!(written["wordless_vowel_ratio"], 0.5);
+        assert_eq!(written["frequency_interval_floor_secs"], 1);
+        assert_eq!(written["last_msg_cap"], 10_000);
+        assert_eq!(written["prompt_timeout_secs"], 60);
+        assert_eq!(written["reconnect_base_secs"], 1);
+        assert_eq!(written["reconnect_max_secs"], 30);
+        // And read back by the overlay, preserving the defaults.
+        let restored = apply_flat_overlay(default_config(), &written);
+        assert_eq!(restored.length_min_chars, 40);
+        assert_eq!(restored.no_spacing_min_len, 20);
+        assert_eq!(restored.spam_min_token_len, 4);
+        assert_eq!(restored.keyboard_mash_min_len, 5);
+        assert_eq!(restored.wordless_vowel_ratio, 0.5);
+        assert_eq!(restored.frequency_interval_floor_secs, 1);
+        assert_eq!(restored.last_msg_cap, 10_000);
+        assert_eq!(restored.prompt_timeout_secs, 60);
+        assert_eq!(restored.reconnect_base_secs, 1);
+        assert_eq!(restored.reconnect_max_secs, 30);
+        // A configured override survives the write → read round trip.
+        let mut overridden = written.clone();
+        overridden.insert("length_min_chars".to_string(), serde_json::json!(99));
+        overridden.insert("reconnect_max_secs".to_string(), serde_json::json!(120));
+        let restored = apply_flat_overlay(default_config(), &overridden);
+        assert_eq!(restored.length_min_chars, 99);
+        assert_eq!(restored.reconnect_max_secs, 120);
+    }
+
+    #[test]
+    fn tunables_drive_scoring() {
+        let mut c = all_off();
+        // Lower the length bar: a short message now earns the length reward.
+        c.length.toggle = true;
+        c.length_min_chars = 5;
+        let (delta, notes) = score_message("hello", &c);
+        assert_eq!(delta, 1);
+        assert!(notes.contains(&"length".to_string()));
+
+        // Raise the wordless bar so a mildly vowel-less message is not penalized.
+        let mut w = all_off();
+        w.wordless.toggle = true;
+        w.wordless_vowel_ratio = 0.1;
+        assert_eq!(score_message("tr th s ae", &w).0, 0);
+        let mut d = all_off();
+        d.wordless.toggle = true;
+        assert_eq!(score_message("tr th s ae", &d).0, -3);
     }
 
     fn sample_chat(user_id: &str) -> ChatMessage {

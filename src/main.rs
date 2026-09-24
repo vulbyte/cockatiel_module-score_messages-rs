@@ -439,17 +439,18 @@ fn ack_preprocess_container(
     }
 }
 
-/// Build the mod-query payload for a scored user. A uuid7-shaped id targets the
-/// user DB row directly; anything else (platform handle) falls back to the
-/// platform+handle pair.
-fn rating_payload(user_id: &str, chat: &ChatMessage, notes: &[String]) -> serde_json::Value {
+/// Build the adjust-score payload for a scored user. A uuid7-shaped id targets
+/// the user DB row directly; anything else (platform handle) falls back to the
+/// platform+handle pair. The engine's `userdb_adjust_score` applies the REAL
+/// signed delta to `score` without touching the human-rating counters.
+fn rating_payload(user_id: &str, chat: &ChatMessage, delta: i64, notes: &[String]) -> serde_json::Value {
     let reason = format!("score-messages: {}", notes.join(","));
     let uuid7_shaped =
         user_id.chars().filter(|c| *c == '-').count() == 4 && user_id.len() == 36;
     if uuid7_shaped {
-        serde_json::json!({ "uuid7": user_id, "reason": reason })
+        serde_json::json!({ "uuid7": user_id, "delta": delta, "reason": reason })
     } else {
-        serde_json::json!({ "platform": chat.platform, "handle": user_id, "reason": reason })
+        serde_json::json!({ "platform": chat.platform, "handle": user_id, "delta": delta, "reason": reason })
     }
 }
 
@@ -656,10 +657,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if delta != 0 && !uuid.is_empty() {
-                                // Apply the score to the user via the engine's mod query.
-                                let query_id =
-                                    if delta > 0 { "mod_commend" } else { "mod_reprimand" };
-                                let payload = rating_payload(&user_id, chat, &notes);
+                                // Apply the real signed delta via the engine's
+                                // score-only virtual query (no ±1 clamp, no
+                                // rating-counter inflation, no cooldown).
+                                let query_id = "userdb_adjust_score";
+                                let payload = rating_payload(&user_id, chat, delta, &notes);
                                 let query = Container {
                                     version: 1,
                                     auth_token: auth_token.clone(),
@@ -845,18 +847,20 @@ mod tests {
     fn rating_payload_uses_uuid7_when_shape_matches() {
         let uuid = "0189a0c1-1111-4222-8333-444455556666";
         let chat = sample_chat(uuid);
-        let p = rating_payload(uuid, &chat, &["spam".to_string()]);
+        let p = rating_payload(uuid, &chat, -5, &["spam".to_string()]);
         assert!(p.get("uuid7").is_some());
         assert!(p.get("platform").is_none());
+        assert_eq!(p["delta"], -5);
         assert_eq!(p["reason"], "score-messages: spam");
     }
 
     #[test]
     fn rating_payload_falls_back_to_platform_handle() {
         let chat = sample_chat("some_chatter");
-        let p = rating_payload("some_chatter", &chat, &[]);
+        let p = rating_payload("some_chatter", &chat, 3, &[]);
         assert!(p.get("uuid7").is_none());
         assert_eq!(p["platform"], "twitch");
         assert_eq!(p["handle"], "some_chatter");
+        assert_eq!(p["delta"], 3);
     }
 }

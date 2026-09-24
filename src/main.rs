@@ -510,6 +510,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Forward operator answers to the awaiting prompt.
                         let _ = prompt_tx_task.send(resp);
                     }
+                    Some(Payload::AuthVerify(_)) => {
+                        // Answer the engine's liveness probe with our auth token
+                        // so a quiet period never severs us (this module does
+                        // nothing during dead air, so it would otherwise be
+                        // flagged unresponsive and killed on a schedule).
+                        let reply = Container {
+                            version: 1,
+                            auth_token: auth_token.clone(),
+                            module_name: module_name.clone(),
+                            module_instance_uuid7: instance_uuid.clone(),
+                            payload: Some(Payload::AuthVerify(AuthVerify {
+                                cur_auth: auth_token.clone(),
+                            })),
+                        };
+                        let mut buf = Vec::new();
+                        if reply.encode(&mut buf).is_ok() {
+                            let mut w = write_shared.lock().await;
+                            let _ = w.send(WsMessage::Binary(buf.into())).await;
+                        }
+                    }
                     Some(Payload::MessagePreProcess(pre)) => {
                         let Some(chat) = &pre.raw_message else { continue };
                         let config = config_shared.lock().unwrap().clone();

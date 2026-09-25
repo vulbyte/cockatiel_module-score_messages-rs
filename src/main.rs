@@ -446,7 +446,12 @@ async fn load_config(
             if let Some(ms) = root.get("module_specific").and_then(|v| v.as_object()) {
                 let legacy = serde_json::from_value::<Config>(root.clone())
                     .unwrap_or_else(|_| default_config());
-                return apply_flat_overlay(legacy, ms);
+                let cfg = apply_flat_overlay(legacy, ms);
+                // Config convention: settings are created with their default
+                // when missing — persist any absent flat keys so every setting
+                // always exists and is editable in place.
+                write_config(&cfg);
+                return cfg;
             }
             // Legacy layouts stored the nested Config at the top level.
             if let Ok(cfg) = serde_json::from_value::<Config>(root) {

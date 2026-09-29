@@ -14,3 +14,16 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v7"] }
+
+# The tuning probe (src/bin/score_probe.rs) is an offline dev tool, not part of
+# the shipped module — gated behind the `probe` feature so `cargo build
+# --release` (what the supervisor runs) never pulls plotters into the module.
+plotters = { version = "0.3", optional = true, features = ["svg_backend"] }
+
+[features]
+probe = ["dep:plotters"]
+
+[[bin]]
+name = "score_probe"
+path = "src/bin/score_probe.rs"
+required-features = ["probe"]

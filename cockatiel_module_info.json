@@ -122,6 +122,60 @@
       "label": "Emoji Score (chat extra)",
       "list": false,
       "sensitive": false
+    },
+    {
+      "key": "max_chars",
+      "label": "Max Chars (AC A ceiling)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "punct_capital_bonus",
+      "label": "Punct+Capital Bonus (AC A)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "punct_capital_penalty",
+      "label": "Punct Without Capital Penalty (AC A)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "capital_penalty",
+      "label": "Leading Capital Penalty (AC C)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "repeating_threshold",
+      "label": "Repeating Threshold (AC D)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "run_on_chars",
+      "label": "Run-on Length (AC F)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "run_on_window",
+      "label": "Run-on Window (AC F)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "grouping_size",
+      "label": "Grouping Size (AC G)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "space_ratio_pct",
+      "label": "Space Ratio Pct (AC E)",
+      "list": false,
+      "sensitive": false
     }
   ],
   "description": "preprocess module that scores chat messages with the Animal Crossing (GCN) letter-scoring algorithm (checks: punctuation, trigrams, leading capital, repeating chars, space ratio, run-on sentences, 32-char groupings; plus an optional emoji bonus) and applies the delta to the user's score",

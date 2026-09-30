@@ -397,8 +397,16 @@ fn print_config_summary(config: &Config) {
         config.frequency.score
     );
     println!(
-        "run_on_chars={} grouping_size={} space_ratio_pct={}%",
-        config.run_on_chars, config.grouping_size, config.space_ratio_pct
+        "max_chars={} punct_cap=+{}/-{} capital_penalty={} repeat_threshold={} run_on={}/{} grouping={} space_ratio_pct={}%",
+        config.max_chars,
+        config.punct_capital_bonus,
+        config.punct_capital_penalty,
+        config.capital_penalty,
+        config.repeating_threshold,
+        config.run_on_chars,
+        config.run_on_window,
+        config.grouping_size,
+        config.space_ratio_pct
     );
 }
 

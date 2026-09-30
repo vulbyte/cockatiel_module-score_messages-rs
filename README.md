@@ -34,9 +34,22 @@ cargo build --release
 
 Runtime settings live in `config.json` (not tracked in git). The engine
 connection details are supplied by the Cockatiel engine at launch. Each check
-has a `<check>_toggle` / `<check>_score` pair; the tunable scalars are
-`run_on_chars` (default 75), `grouping_size` (default 32) and `space_ratio_pct`
-(default 20).
+has a `<check>_toggle` / `<check>_score` pair, and the scalar thresholds are:
+
+| Key | Default | What it controls |
+|-----|---------|------------------|
+| `max_chars` | 192 | Check A ceiling for the end-punctuation reward; trigram padding length |
+| `punct_capital_bonus` | 10 | Check A: +pts per punctuation followed (≤3 chars) by a capital |
+| `punct_capital_penalty` | 10 | Check A: −pts per punctuation NOT followed by a capital |
+| `capital_penalty` | 10 | Check C: −pts when the leading non-space char isn't a capital |
+| `repeating_threshold` | 3 | Check D: sequential repeats of a letter needed to trigger the penalty |
+| `run_on_chars` | 75 | Check F: no-punctuation run length that triggers the run-on penalty |
+| `run_on_window` | 76 | Check F: the scan only evaluates while more than this many chars remain |
+| `grouping_size` | 32 | Check G: the space-grouping window |
+| `space_ratio_pct` | 20 | Check E: spaces ÷ non-spaces (%) threshold for the reward |
+
+All are adjustable in `config.json` — use the `score_probe` tool to see how
+changes shift the distribution before applying them live.
 
 ## Tuning probe (`score_probe`)
 

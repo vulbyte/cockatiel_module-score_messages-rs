@@ -118,6 +118,28 @@ pub struct Config {
     pub grouping_size: usize,
     #[serde(default = "default_space_ratio_pct")]
     pub space_ratio_pct: i64,
+    /// Check A: the letter-body ceiling under which the ending-punctuation
+    /// reward is granted (and the trigram padding length).
+    #[serde(default = "default_max_chars")]
+    pub max_chars: usize,
+    /// Check A: points per punctuation mark that is followed (within 3 chars)
+    /// by a capital letter.
+    #[serde(default = "default_punct_capital_bonus")]
+    pub punct_capital_bonus: i64,
+    /// Check A: points per punctuation mark NOT followed (within 3 chars) by a
+    /// capital letter.
+    #[serde(default = "default_punct_capital_penalty")]
+    pub punct_capital_penalty: i64,
+    /// Check C: the penalty when the leading non-space char is not a capital.
+    #[serde(default = "default_capital_penalty")]
+    pub capital_penalty: i64,
+    /// Check D: how many sequential repeats of a letter trigger the penalty.
+    #[serde(default = "default_repeating_threshold")]
+    pub repeating_threshold: usize,
+    /// Check F: the run-on scan only evaluates while more than this many chars
+    /// remain in the message.
+    #[serde(default = "default_run_on_window")]
+    pub run_on_window: usize,
     #[serde(default = "default_frequency_interval_floor_secs")]
     pub frequency_interval_floor_secs: u64,
     #[serde(default = "default_last_msg_cap")]
@@ -158,6 +180,24 @@ pub fn default_run_on_chars() -> usize {
 pub fn default_grouping_size() -> usize {
     GROUPING_SIZE
 }
+pub fn default_max_chars() -> usize {
+    MAX_CHARS
+}
+pub fn default_punct_capital_bonus() -> i64 {
+    10
+}
+pub fn default_punct_capital_penalty() -> i64 {
+    10
+}
+pub fn default_capital_penalty() -> i64 {
+    10
+}
+pub fn default_repeating_threshold() -> usize {
+    3
+}
+pub fn default_run_on_window() -> usize {
+    76
+}
 pub fn default_space_ratio_pct() -> i64 {
     SPACE_RATIO_PERCENT
 }
@@ -191,6 +231,12 @@ pub fn default_config() -> Config {
         run_on_chars: default_run_on_chars(),
         grouping_size: default_grouping_size(),
         space_ratio_pct: default_space_ratio_pct(),
+        max_chars: default_max_chars(),
+        punct_capital_bonus: default_punct_capital_bonus(),
+        punct_capital_penalty: default_punct_capital_penalty(),
+        capital_penalty: default_capital_penalty(),
+        repeating_threshold: default_repeating_threshold(),
+        run_on_window: default_run_on_window(),
         frequency_interval_floor_secs: default_frequency_interval_floor_secs(),
         last_msg_cap: default_last_msg_cap(),
         prompt_timeout_secs: default_prompt_timeout_secs(),
@@ -303,6 +349,24 @@ pub fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_js
     if let Some(v) = parse_i64(ms.get("space_ratio_pct")) {
         cfg.space_ratio_pct = v;
     }
+    if let Some(v) = parse_usize(ms.get("max_chars")) {
+        cfg.max_chars = v;
+    }
+    if let Some(v) = parse_i64(ms.get("punct_capital_bonus")) {
+        cfg.punct_capital_bonus = v;
+    }
+    if let Some(v) = parse_i64(ms.get("punct_capital_penalty")) {
+        cfg.punct_capital_penalty = v;
+    }
+    if let Some(v) = parse_i64(ms.get("capital_penalty")) {
+        cfg.capital_penalty = v;
+    }
+    if let Some(v) = parse_usize(ms.get("repeating_threshold")) {
+        cfg.repeating_threshold = v;
+    }
+    if let Some(v) = parse_usize(ms.get("run_on_window")) {
+        cfg.run_on_window = v;
+    }
     if let Some(v) = parse_u64(ms.get("frequency_interval_floor_secs")) {
         cfg.frequency_interval_floor_secs = v;
     }
@@ -363,6 +427,12 @@ pub fn flat_map_for_write(
     put_scalar!("run_on_chars", parse_usize, cfg.run_on_chars);
     put_scalar!("grouping_size", parse_usize, cfg.grouping_size);
     put_scalar!("space_ratio_pct", parse_i64, cfg.space_ratio_pct);
+    put_scalar!("max_chars", parse_usize, cfg.max_chars);
+    put_scalar!("punct_capital_bonus", parse_i64, cfg.punct_capital_bonus);
+    put_scalar!("punct_capital_penalty", parse_i64, cfg.punct_capital_penalty);
+    put_scalar!("capital_penalty", parse_i64, cfg.capital_penalty);
+    put_scalar!("repeating_threshold", parse_usize, cfg.repeating_threshold);
+    put_scalar!("run_on_window", parse_usize, cfg.run_on_window);
     put_scalar!(
         "frequency_interval_floor_secs",
         parse_u64,
@@ -413,7 +483,7 @@ fn check_a(input: &str, cfg: &Config) -> i64 {
     let trimmed: String = input.trim_matches([' ', '\t']).to_string();
     let mut score = 0;
 
-    if trimmed.chars().count() < MAX_CHARS && matches!(trimmed.chars().last(), Some('.') | Some('!') | Some('?')) {
+    if trimmed.chars().count() < cfg.max_chars && matches!(trimmed.chars().last(), Some('.') | Some('!') | Some('?')) {
         score += cfg.punctuation.score;
     }
 
@@ -433,10 +503,10 @@ fn check_a(input: &str, cfg: &Config) -> i64 {
         }
         let next3 = &chars[punct + 1..punct + 4];
         if let Some(cap_rel) = next3.iter().position(|c| c.is_ascii_uppercase()) {
-            score += cfg.punctuation.score / 2;
+            score += cfg.punct_capital_bonus;
             i = punct + 1 + cap_rel + 1;
         } else {
-            score -= cfg.punctuation.score / 2;
+            score -= cfg.punct_capital_penalty;
             i = punct + 4;
         }
     }
@@ -488,7 +558,7 @@ fn trigram_lines() -> &'static [&'static str] {
 /// the bug `continue`s past later `~` headers (a `break` would fix it).
 fn check_b(input: &str, cfg: &Config) -> i64 {
     let mut padded = input.to_string();
-    padded.push_str(&" ".repeat(MAX_CHARS.saturating_sub(padded.chars().count())));
+    padded.push_str(&" ".repeat(cfg.max_chars.saturating_sub(padded.chars().count())));
     let all_trigrams = get_all_trigrams(&padded);
     let lines = trigram_lines();
 
@@ -521,7 +591,7 @@ fn check_b(input: &str, cfg: &Config) -> i64 {
 fn check_c(input: &str, cfg: &Config) -> i64 {
     match input.chars().find(|c| !c.is_whitespace()) {
         Some(c) if c.is_ascii_uppercase() => cfg.capital.score,
-        Some(_) => -(cfg.capital.score / 2),
+        Some(_) => -cfg.capital_penalty,
         None => 0,
     }
 }
@@ -541,7 +611,7 @@ fn check_d(input: &str, cfg: &Config) -> i64 {
                 run = 1;
                 prev = Some(c);
             }
-            if run >= 3 {
+            if run >= cfg.repeating_threshold as u32 {
                 return -cfg.repeating.score;
             }
         } else {
@@ -570,8 +640,8 @@ fn check_f(input: &str, cfg: &Config) -> i64 {
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
     let mut i = 0;
-    // The game only evaluates while more than 76 chars remain.
-    while len.saturating_sub(i) > 76 {
+    // The game only evaluates while more than `run_on_window` chars remain.
+    while len.saturating_sub(i) > cfg.run_on_window {
         if matches!(chars[i], '.' | '?' | '!') {
             let mut sentence_len = 0usize;
             i += 1;
@@ -806,18 +876,33 @@ mod tests {
         assert_eq!(written["run_on_chars"], 75);
         assert_eq!(written["grouping_size"], 32);
         assert_eq!(written["space_ratio_pct"], 20);
+        assert_eq!(written["max_chars"], 192);
+        assert_eq!(written["punct_capital_bonus"], 10);
+        assert_eq!(written["punct_capital_penalty"], 10);
+        assert_eq!(written["capital_penalty"], 10);
+        assert_eq!(written["repeating_threshold"], 3);
+        assert_eq!(written["run_on_window"], 76);
         assert_eq!(written["prompt_timeout_secs"], 60);
         let restored = apply_flat_overlay(default_config(), &written);
         assert_eq!(restored.run_on_chars, 75);
         assert_eq!(restored.grouping_size, 32);
         assert_eq!(restored.space_ratio_pct, 20);
+        assert_eq!(restored.max_chars, 192);
+        assert_eq!(restored.punct_capital_bonus, 10);
+        assert_eq!(restored.capital_penalty, 10);
+        assert_eq!(restored.repeating_threshold, 3);
+        assert_eq!(restored.run_on_window, 76);
         // Overrides survive a round trip.
         let mut overridden = written.clone();
         overridden.insert("run_on_chars".to_string(), serde_json::json!(60));
         overridden.insert("space_ratio_pct".to_string(), serde_json::json!(30));
+        overridden.insert("punct_capital_bonus".to_string(), serde_json::json!(25));
+        overridden.insert("repeating_threshold".to_string(), serde_json::json!(5));
         let restored = apply_flat_overlay(default_config(), &overridden);
         assert_eq!(restored.run_on_chars, 60);
         assert_eq!(restored.space_ratio_pct, 30);
+        assert_eq!(restored.punct_capital_bonus, 25);
+        assert_eq!(restored.repeating_threshold, 5);
     }
 
     #[test]
@@ -837,5 +922,19 @@ mod tests {
         assert_eq!(delta, 0); // first 8 chars contain a space → no penalty
         let (delta, _) = score_message("helloworld", &g);
         assert_eq!(delta, -20);
+        // Raise the repeating threshold: "aaa" (3 repeats) is now allowed.
+        let mut r = all_off();
+        r.repeating.toggle = true;
+        r.repeating_threshold = 4;
+        let (delta, _) = score_message("aaa", &r);
+        assert_eq!(delta, 0, "3 repeats under a threshold of 4 should pass");
+        let (delta, _) = score_message("aaaa", &r);
+        assert_eq!(delta, -50);
+        // The capital penalty is independently tunable from the reward.
+        let mut cp = all_off();
+        cp.capital.toggle = true;
+        cp.capital_penalty = 3;
+        let (delta, _) = score_message("hello", &cp);
+        assert_eq!(delta, -3);
     }
 }

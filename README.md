@@ -53,6 +53,24 @@ enable with `viewership_toggle` in `config.json`.
 cargo build --release
 ```
 
+## Testing
+
+```sh
+# All tests (13 lib + 2 module + 8 probe):
+cargo test --features probe --all-targets
+
+# Just the scoring lib (fastest — the pure AC-check + multiplier logic):
+cargo test --lib
+
+# A specific test:
+cargo test --lib viewership
+cargo test --lib check_g
+```
+
+The viewership multiplier only kicks in at runtime (it needs a live viewer
+count from the engine) — the `score_probe` tool shows the pre-multiplier
+`sum(A–G)` distribution, which is what you'd be tuning.
+
 ## Runtime config
 
 Runtime settings live in `config.json` (not tracked in git). The engine

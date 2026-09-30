@@ -1,15 +1,50 @@
 //! The pure scoring core for the score-messages module.
 //!
-//! Everything here is a deterministic function of its inputs (a message + a
-//! config), with no network, no state, and no side effects — which is exactly
-//! what makes it unit-testable and, crucially, **probeable**: the tuning probe
+//! Scoring follows the Animal Crossing (GCN) letter-scoring algorithm (see
+//! https://hunter-r.com/ac-letter-scorer/ and
+//! https://github.com/HunterRDev/AC-Letter-Scorer), ported to chat messages.
+//! A message is scored through seven checks (A–G) whose points sum to the
+//! delta applied to the user's score:
+//!
+//!   A. Punctuation        — +20 if the text ends with `.`/`!`/`?` (and is
+//!                           under the 192-char max); then for every
+//!                           punctuation mark, +10 if a capital letter appears
+//!                           within the next 3 chars, else −10.
+//!   B. Trigrams           — +3 per valid leading-3-chars-of-each-word
+//!                           trigram found in the game's (bugged) trigram
+//!                           tables.
+//!   C. Leading capital    — +20 if the first non-space char is a capital,
+//!                           else −10.
+//!   D. Repeating chars    — −50 if any letter is repeated 3+ times
+//!                           sequentially (spaces ignored).
+//!   E. Space ratio        — +20 if spaces are ≥ 20% of non-space chars,
+//!                           else −20.
+//!   F. Run-on sentence    — −150 if a run of 75+ chars has no punctuation
+//!                           after a punctuation mark.
+//!   G. 32-char groupings  — −20 per 32-char group that contains no space.
+//!
+//! Everything is a deterministic function of its inputs (a message + a
+//! config), with no network, no state and no side effects — which is exactly
+//! what makes it unit-testable and probeable: the tuning probe
 //! (`src/bin/score_probe.rs`) runs real chat sentences through this same code
-//! to visualise how rule weights shape the distribution of message scores.
+//! to visualise how the checks shape the distribution of message scores.
 //!
 //! The live module (`main.rs`) calls the same functions, so a tuning decision
 //! made against the probe is guaranteed to match production behaviour.
 
 use serde::{Deserialize, Serialize};
+
+/// The game's letter body maximum. Checks A uses this as a ceiling.
+const MAX_CHARS: usize = 192;
+
+/// The run-on check's no-punctuation threshold (chars).
+pub const RUN_ON_CHARS: usize = 75;
+
+/// The 32-char space-grouping window.
+pub const GROUPING_SIZE: usize = 32;
+
+/// The space-ratio threshold (spaces ÷ non-spaces, ×100).
+pub const SPACE_RATIO_PERCENT: i64 = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
@@ -19,7 +54,7 @@ pub struct Rule {
 
 impl Default for Rule {
     fn default() -> Self {
-        Self { toggle: true, score: 1 }
+        Self { toggle: true, score: 20 }
     }
 }
 
@@ -47,32 +82,42 @@ fn default_interval() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    // ── The seven AC letter checks ──────────────────────────────────────
+    /// Check A: punctuation.
     #[serde(default)]
     pub punctuation: Rule,
-    #[serde(default)]
-    pub question: Rule,
-    #[serde(default)]
-    pub length: Rule,
-    #[serde(default)]
-    pub spam: Rule,
-    #[serde(default)]
-    pub no_spacing: Rule,
-    #[serde(default)]
-    pub wordless: Rule,
-    #[serde(default)]
+    /// Check B: valid trigrams.
+    #[serde(default = "default_trigram")]
+    pub trigram: Rule,
+    /// Check C: leading capital.
+    #[serde(default = "default_capital")]
+    pub capital: Rule,
+    /// Check D: repeating characters.
+    #[serde(default = "default_repeating")]
+    pub repeating: Rule,
+    /// Check E: space ratio.
+    #[serde(default = "default_space_ratio")]
+    pub space_ratio: Rule,
+    /// Check F: run-on sentence.
+    #[serde(default = "default_run_on")]
+    pub run_on: Rule,
+    /// Check G: 32-char space groupings.
+    #[serde(default = "default_grouping")]
+    pub grouping: Rule,
+    // ── Chat-specific extras (not part of the AC algorithm) ────────────
+    /// Reward messages that include an emoji (engagement signal).
+    #[serde(default = "default_emoji")]
     pub emoji: Rule,
+    /// Punish posting again too soon after a user's last message.
     #[serde(default)]
     pub frequency: FrequencyRule,
-    #[serde(default = "default_length_min_chars")]
-    pub length_min_chars: i64,
-    #[serde(default = "default_no_spacing_min_len")]
-    pub no_spacing_min_len: i64,
-    #[serde(default = "default_spam_min_token_len")]
-    pub spam_min_token_len: i64,
-    #[serde(default = "default_keyboard_mash_min_len")]
-    pub keyboard_mash_min_len: i64,
-    #[serde(default = "default_wordless_vowel_ratio")]
-    pub wordless_vowel_ratio: f64,
+    // ── Tunable scalars (defaults match the game's algorithm) ───────────
+    #[serde(default = "default_run_on_chars")]
+    pub run_on_chars: usize,
+    #[serde(default = "default_grouping_size")]
+    pub grouping_size: usize,
+    #[serde(default = "default_space_ratio_pct")]
+    pub space_ratio_pct: i64,
     #[serde(default = "default_frequency_interval_floor_secs")]
     pub frequency_interval_floor_secs: u64,
     #[serde(default = "default_last_msg_cap")]
@@ -85,61 +130,67 @@ pub struct Config {
     pub reconnect_max_secs: u64,
 }
 
-pub fn default_length_min_chars() -> i64 {
-    40
+fn default_trigram() -> Rule {
+    Rule { toggle: true, score: 3 }
+}
+fn default_capital() -> Rule {
+    Rule { toggle: true, score: 20 }
+}
+fn default_repeating() -> Rule {
+    Rule { toggle: true, score: 50 }
+}
+fn default_space_ratio() -> Rule {
+    Rule { toggle: true, score: 20 }
+}
+fn default_run_on() -> Rule {
+    Rule { toggle: true, score: 150 }
+}
+fn default_grouping() -> Rule {
+    Rule { toggle: true, score: 20 }
+}
+fn default_emoji() -> Rule {
+    Rule { toggle: true, score: 1 }
 }
 
-pub fn default_no_spacing_min_len() -> i64 {
-    20
+pub fn default_run_on_chars() -> usize {
+    RUN_ON_CHARS
 }
-
-pub fn default_spam_min_token_len() -> i64 {
-    4
+pub fn default_grouping_size() -> usize {
+    GROUPING_SIZE
 }
-
-pub fn default_keyboard_mash_min_len() -> i64 {
-    5
+pub fn default_space_ratio_pct() -> i64 {
+    SPACE_RATIO_PERCENT
 }
-
-pub fn default_wordless_vowel_ratio() -> f64 {
-    0.5
-}
-
 pub fn default_frequency_interval_floor_secs() -> u64 {
     1
 }
-
 pub fn default_last_msg_cap() -> usize {
     10_000
 }
-
 pub fn default_prompt_timeout_secs() -> u32 {
     60
 }
-
 pub fn default_reconnect_base_secs() -> u64 {
     1
 }
-
 pub fn default_reconnect_max_secs() -> u64 {
     30
 }
 
 pub fn default_config() -> Config {
     Config {
-        punctuation: Rule { toggle: true, score: 1 },
-        question: Rule { toggle: true, score: 2 },
-        length: Rule { toggle: true, score: 1 },
-        spam: Rule { toggle: true, score: -5 },
-        no_spacing: Rule { toggle: true, score: -2 },
-        wordless: Rule { toggle: true, score: -3 },
-        emoji: Rule { toggle: true, score: 1 },
+        punctuation: Rule { toggle: true, score: 20 },
+        trigram: default_trigram(),
+        capital: default_capital(),
+        repeating: default_repeating(),
+        space_ratio: default_space_ratio(),
+        run_on: default_run_on(),
+        grouping: default_grouping(),
+        emoji: default_emoji(),
         frequency: FrequencyRule::default(),
-        length_min_chars: default_length_min_chars(),
-        no_spacing_min_len: default_no_spacing_min_len(),
-        spam_min_token_len: default_spam_min_token_len(),
-        keyboard_mash_min_len: default_keyboard_mash_min_len(),
-        wordless_vowel_ratio: default_wordless_vowel_ratio(),
+        run_on_chars: default_run_on_chars(),
+        grouping_size: default_grouping_size(),
+        space_ratio_pct: default_space_ratio_pct(),
         frequency_interval_floor_secs: default_frequency_interval_floor_secs(),
         last_msg_cap: default_last_msg_cap(),
         prompt_timeout_secs: default_prompt_timeout_secs(),
@@ -148,9 +199,11 @@ pub fn default_config() -> Config {
     }
 }
 
+// ── config parsing helpers (identical to the live module's semantics) ───
+
 /// Parse a toggle value that may be a JSON bool, number, or string like
-/// "1"/"true". Unparseable garbage (e.g. "1t") yields None so callers fall
-/// back to a default instead of panicking.
+/// "1"/"true". Unparseable garbage yields None so callers fall back to a
+/// default instead of panicking.
 pub fn parse_toggle(v: Option<&serde_json::Value>) -> Option<bool> {
     match v? {
         serde_json::Value::Bool(b) => Some(*b),
@@ -217,9 +270,7 @@ pub fn parse_u32(v: Option<&serde_json::Value>) -> Option<u32> {
     parse_u64(v).and_then(|u| u32::try_from(u).ok())
 }
 
-/// Overlay the engine's flat module_specific credential keys onto a Config,
-/// falling back to the given legacy values for any key that is absent or
-/// unparseable.
+/// Overlay the engine's flat module_specific credential keys onto a Config.
 pub fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_json::Value>) -> Config {
     macro_rules! apply_rule {
         ($field:ident, $prefix:literal) => {
@@ -232,30 +283,25 @@ pub fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_js
         };
     }
     apply_rule!(punctuation, "punctuation");
-    apply_rule!(question, "question");
-    apply_rule!(length, "length");
-    apply_rule!(spam, "spam");
-    apply_rule!(no_spacing, "no_spacing");
-    apply_rule!(wordless, "wordless");
+    apply_rule!(trigram, "trigram");
+    apply_rule!(capital, "capital");
+    apply_rule!(repeating, "repeating");
+    apply_rule!(space_ratio, "space_ratio");
+    apply_rule!(run_on, "run_on");
+    apply_rule!(grouping, "grouping");
     apply_rule!(emoji, "emoji");
     apply_rule!(frequency, "frequency");
     if let Some(i) = parse_u64(ms.get("frequency_interval_secs")) {
         cfg.frequency.interval_secs = i;
     }
-    if let Some(v) = parse_score(ms.get("length_min_chars")) {
-        cfg.length_min_chars = v;
+    if let Some(v) = parse_usize(ms.get("run_on_chars")) {
+        cfg.run_on_chars = v;
     }
-    if let Some(v) = parse_score(ms.get("no_spacing_min_len")) {
-        cfg.no_spacing_min_len = v;
+    if let Some(v) = parse_usize(ms.get("grouping_size")) {
+        cfg.grouping_size = v;
     }
-    if let Some(v) = parse_score(ms.get("spam_min_token_len")) {
-        cfg.spam_min_token_len = v;
-    }
-    if let Some(v) = parse_score(ms.get("keyboard_mash_min_len")) {
-        cfg.keyboard_mash_min_len = v;
-    }
-    if let Some(v) = parse_f64(ms.get("wordless_vowel_ratio")) {
-        cfg.wordless_vowel_ratio = v;
+    if let Some(v) = parse_i64(ms.get("space_ratio_pct")) {
+        cfg.space_ratio_pct = v;
     }
     if let Some(v) = parse_u64(ms.get("frequency_interval_floor_secs")) {
         cfg.frequency_interval_floor_secs = v;
@@ -275,13 +321,15 @@ pub fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_js
     cfg
 }
 
-/// Build the flat module_specific map for a Config, preferring values already
-/// present (and parseable) in the existing module_specific object, then
-/// migrating legacy top-level nested values, then falling back to the given
-/// Config.
+fn parse_i64(v: Option<&serde_json::Value>) -> Option<i64> {
+    parse_score(v)
+}
+
+/// Build the flat module_specific map for a Config (defaults first, so every
+/// tunable key always exists and is editable in place).
 pub fn flat_map_for_write(
     cfg: &Config,
-    root: &serde_json::Value,
+    _root: &serde_json::Value,
     ms: &serde_json::Map<String, serde_json::Value>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut out = serde_json::Map::new();
@@ -289,23 +337,19 @@ pub fn flat_map_for_write(
         ($field:ident, $prefix:literal) => {
             let toggle_key = concat!($prefix, "_toggle");
             let score_key = concat!($prefix, "_score");
-            let legacy = root.get($prefix).and_then(|r| r.as_object());
-            let toggle = parse_toggle(ms.get(toggle_key))
-                .or_else(|| legacy.and_then(|l| parse_toggle(l.get("toggle"))))
-                .unwrap_or(cfg.$field.toggle);
-            let score = parse_score(ms.get(score_key))
-                .or_else(|| legacy.and_then(|l| parse_score(l.get("score"))))
-                .unwrap_or(cfg.$field.score);
+            let toggle = parse_toggle(ms.get(toggle_key)).unwrap_or(cfg.$field.toggle);
+            let score = parse_score(ms.get(score_key)).unwrap_or(cfg.$field.score);
             out.insert(toggle_key.to_string(), serde_json::Value::Bool(toggle));
             out.insert(score_key.to_string(), serde_json::json!(score));
         };
     }
     put_rule!(punctuation, "punctuation");
-    put_rule!(question, "question");
-    put_rule!(length, "length");
-    put_rule!(spam, "spam");
-    put_rule!(no_spacing, "no_spacing");
-    put_rule!(wordless, "wordless");
+    put_rule!(trigram, "trigram");
+    put_rule!(capital, "capital");
+    put_rule!(repeating, "repeating");
+    put_rule!(space_ratio, "space_ratio");
+    put_rule!(run_on, "run_on");
+    put_rule!(grouping, "grouping");
     put_rule!(emoji, "emoji");
     put_rule!(frequency, "frequency");
     let interval = parse_u64(ms.get("frequency_interval_secs")).unwrap_or(cfg.frequency.interval_secs);
@@ -316,11 +360,9 @@ pub fn flat_map_for_write(
             out.insert($key.to_string(), serde_json::json!(v));
         }};
     }
-    put_scalar!("length_min_chars", parse_score, cfg.length_min_chars);
-    put_scalar!("no_spacing_min_len", parse_score, cfg.no_spacing_min_len);
-    put_scalar!("spam_min_token_len", parse_score, cfg.spam_min_token_len);
-    put_scalar!("keyboard_mash_min_len", parse_score, cfg.keyboard_mash_min_len);
-    put_scalar!("wordless_vowel_ratio", parse_f64, cfg.wordless_vowel_ratio);
+    put_scalar!("run_on_chars", parse_usize, cfg.run_on_chars);
+    put_scalar!("grouping_size", parse_usize, cfg.grouping_size);
+    put_scalar!("space_ratio_pct", parse_i64, cfg.space_ratio_pct);
     put_scalar!(
         "frequency_interval_floor_secs",
         parse_u64,
@@ -333,10 +375,7 @@ pub fn flat_map_for_write(
     out
 }
 
-/// Resolve a Config from a config.json root the same way the live module does:
-/// flat `module_specific` overlay first, legacy nested top-level Config second,
-/// code defaults last. Used by both `main.rs` and the tuning probe so they
-/// always agree on the effective config.
+/// Resolve a Config from a config.json root the same way the live module does.
 pub fn config_from_root(root: &serde_json::Value) -> Config {
     if let Some(ms) = root.get("module_specific").and_then(|v| v.as_object()) {
         let legacy = serde_json::from_value::<Config>(root.clone())
@@ -349,36 +388,9 @@ pub fn config_from_root(root: &serde_json::Value) -> Config {
     default_config()
 }
 
-/// Is this token made of repeated characters (spam: bbbbb, asdlfkjsqaldkfja)?
-pub fn looks_like_spam_token(token: &str, min_token_len: i64, mash_min_len: i64) -> bool {
-    let t = token.to_lowercase();
-    if (t.len() as i64) < min_token_len {
-        return false;
-    }
-    let chars: Vec<char> = t.chars().collect();
-    // Repeated single char, or no vowels (keyboard mashing).
-    let all_same = chars.iter().all(|c| *c == chars[0]);
-    if all_same {
-        return true;
-    }
-    let has_vowel = chars.iter().any(|c| "aeiou".contains(*c));
-    !has_vowel && (t.len() as i64) >= mash_min_len
-}
+// ── the seven AC checks ─────────────────────────────────────────────────
 
-pub fn is_wordless(message: &str, vowel_ratio: f64) -> bool {
-    // Uses a crude trigram check: if most tokens contain no vowels, treat as wordless.
-    let tokens: Vec<&str> = message.split_whitespace().collect();
-    if tokens.is_empty() {
-        return false;
-    }
-    let wordlike = tokens
-        .iter()
-        .filter(|t| t.chars().any(|c| "aeiou".contains(c.to_ascii_lowercase())))
-        .count();
-    (wordlike as f64 / tokens.len() as f64) < vowel_ratio
-}
-
-/// Common emoji Unicode ranges.
+/// Common emoji Unicode ranges (chat-specific extra, not an AC check).
 pub fn is_emoji(c: char) -> bool {
     let cp = c as u32;
     (0x1F300..=0x1F5FF).contains(&cp)
@@ -391,65 +403,267 @@ pub fn is_emoji(c: char) -> bool {
         || (0x1F000..=0x1F0FF).contains(&cp)
 }
 
-/// Score a message and return the total delta plus the rules that fired.
-/// Positive = reward, negative = punishment.
+/// Check A — Punctuation.
+///
+/// +20 if the (whitespace-trimmed) text ends with `.`/`!`/`?` and is under the
+/// 192-char max. Then scan every punctuation mark: if a capital letter appears
+/// within the next 3 characters, +10; otherwise −10. Scan position advances
+/// past the found capital (or 4 chars) so each occurrence is scored once.
+fn check_a(input: &str, cfg: &Config) -> i64 {
+    let trimmed: String = input.trim_matches([' ', '\t']).to_string();
+    let mut score = 0;
+
+    if trimmed.chars().count() < MAX_CHARS && matches!(trimmed.chars().last(), Some('.') | Some('!') | Some('?')) {
+        score += cfg.punctuation.score;
+    }
+
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let Some(rel) = chars[i..].iter().position(|c| matches!(c, '.' | '!' | '?')) else {
+            break;
+        };
+        let punct = i + rel;
+        // Nothing non-space after the punctuation: stop scanning.
+        if chars[punct + 1..].iter().all(|c| c.is_whitespace()) {
+            break;
+        }
+        if punct + 3 >= chars.len() {
+            break;
+        }
+        let next3 = &chars[punct + 1..punct + 4];
+        if let Some(cap_rel) = next3.iter().position(|c| c.is_ascii_uppercase()) {
+            score += cfg.punctuation.score / 2;
+            i = punct + 1 + cap_rel + 1;
+        } else {
+            score -= cfg.punctuation.score / 2;
+            i = punct + 4;
+        }
+    }
+    score
+}
+
+/// Is this char a word separator for the trigram scan? (whitespace or .,!?)
+fn is_separator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?')
+}
+
+/// Extract every leading-3-chars-of-a-word trigram from the (space-padded)
+/// text, mirroring the game's word scanner.
+fn get_all_trigrams(input: &str) -> Vec<String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut trigrams = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        while i < chars.len() && is_separator(chars[i]) {
+            i += 1;
+        }
+        if i < chars.len() {
+            let end = (i + 3).min(chars.len());
+            trigrams.push(chars[i..end].iter().collect());
+            while i < chars.len() && !is_separator(chars[i]) {
+                i += 1;
+            }
+        }
+    }
+    trigrams
+}
+
+/// The game's bugged trigram tables (North American / Australian bug: each
+/// table is much longer than intended — a suffix is accepted even when it
+/// falls in a later letter's section).
+static TRIGRAMS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+
+fn trigram_lines() -> &'static [&'static str] {
+    TRIGRAMS.get_or_init(|| {
+        let data = include_str!("data/trigrams_bugged.txt");
+        data.lines().collect()
+    })
+}
+
+/// Check B — Trigrams.
+///
+/// +`score` per valid trigram (the first 3 chars of each word) found in the
+/// bugged trigram tables. The table is `~X~`-sectioned with 2-char suffixes;
+/// the bug `continue`s past later `~` headers (a `break` would fix it).
+fn check_b(input: &str, cfg: &Config) -> i64 {
+    let mut padded = input.to_string();
+    padded.push_str(&" ".repeat(MAX_CHARS.saturating_sub(padded.chars().count())));
+    let all_trigrams = get_all_trigrams(&padded);
+    let lines = trigram_lines();
+
+    let mut counter = 0;
+    for trigram in &all_trigrams {
+        if trigram.chars().count() < 3 {
+            break;
+        }
+        let first = trigram.chars().next().unwrap().to_ascii_uppercase();
+        let key = format!("~{first}~");
+        let Some(index) = lines.iter().position(|l| l.starts_with(&key)) else {
+            continue;
+        };
+        let final_two: String = trigram.chars().skip(1).take(2).collect();
+        for line in &lines[index + 1..] {
+            // The bug: continue past later section headers instead of breaking.
+            if line.starts_with('~') {
+                continue;
+            }
+            if line.contains(&final_two) {
+                counter += 1;
+                break;
+            }
+        }
+    }
+    counter * cfg.trigram.score
+}
+
+/// Check C — Leading capital.
+fn check_c(input: &str, cfg: &Config) -> i64 {
+    match input.chars().find(|c| !c.is_whitespace()) {
+        Some(c) if c.is_ascii_uppercase() => cfg.capital.score,
+        Some(_) => -(cfg.capital.score / 2),
+        None => 0,
+    }
+}
+
+/// Check D — Repeating characters. −50 if any letter repeats 3+ times
+/// sequentially (spaces removed first, per the game).
+fn check_d(input: &str, cfg: &Config) -> i64 {
+    let trimmed: String = input.trim_matches([' ', '\t']).chars().filter(|c| *c != ' ').collect();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut run = 0u32;
+    let mut prev: Option<char> = None;
+    for c in chars {
+        if c.is_ascii_alphabetic() {
+            if prev == Some(c) {
+                run += 1;
+            } else {
+                run = 1;
+                prev = Some(c);
+            }
+            if run >= 3 {
+                return -cfg.repeating.score;
+            }
+        } else {
+            run = 0;
+            prev = None;
+        }
+    }
+    0
+}
+
+/// Check E — Space ratio. +20 if spaces are ≥ 20% of non-space chars, else −20.
+fn check_e(input: &str, cfg: &Config) -> i64 {
+    let num_spaces = input.chars().filter(|c| *c == ' ').count() as i64;
+    let total = input.chars().count() as i64;
+    let num_non = total - num_spaces;
+    if num_non > 0 && (num_spaces * 100) / num_non >= cfg.space_ratio_pct {
+        cfg.space_ratio.score
+    } else {
+        -cfg.space_ratio.score
+    }
+}
+
+/// Check F — Run-on sentence. −150 if, after a punctuation mark, a run of
+/// `run_on_chars`+ sequential chars has no punctuation.
+fn check_f(input: &str, cfg: &Config) -> i64 {
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    // The game only evaluates while more than 76 chars remain.
+    while len.saturating_sub(i) > 76 {
+        if matches!(chars[i], '.' | '?' | '!') {
+            let mut sentence_len = 0usize;
+            i += 1;
+            while i < len && !matches!(chars[i], '.' | '?' | '!') {
+                sentence_len += 1;
+                if sentence_len >= cfg.run_on_chars {
+                    break;
+                }
+                i += 1;
+            }
+            if sentence_len >= cfg.run_on_chars {
+                return -cfg.run_on.score;
+            }
+        }
+        i += 1;
+    }
+    0
+}
+
+/// Check G — 32-char space groupings. −20 per 32-char group with no space.
+fn check_g(input: &str, cfg: &Config) -> i64 {
+    let trimmed: Vec<char> = input.trim_matches([' ', '\t']).chars().collect();
+    let total = trimmed.len();
+    let size = cfg.grouping_size.max(1);
+    let groups = total / size;
+    let mut score = 0;
+    for g in 0..groups {
+        let group = &trimmed[g * size..(g + 1) * size];
+        if !group.contains(&' ') {
+            score -= cfg.grouping.score;
+        }
+    }
+    score
+}
+
+/// Score a message with the seven AC checks (plus the emoji extra) and return
+/// the total delta plus the rules that fired. Positive = reward, negative =
+/// punishment.
 pub fn score_message(message: &str, cfg: &Config) -> (i64, Vec<String>) {
     let mut delta = 0i64;
     let mut notes = Vec::new();
 
-    let trimmed = message.trim();
-
-    // Punctuation: reward for ending with ., !, ?.
     if cfg.punctuation.toggle {
-        if let Some(last) = trimmed.chars().last() {
-            if ".!?".contains(last) {
-                delta += cfg.punctuation.score;
-                notes.push("punctuation".into());
-            }
+        let d = check_a(message, cfg);
+        if d != 0 {
+            delta += d;
+            notes.push("punctuation".into());
         }
     }
-
-    // Questions: reward for ending with ?.
-    if cfg.question.toggle && trimmed.ends_with('?') {
-        delta += cfg.question.score;
-        notes.push("question".into());
-    }
-
-    // Length: reward for substantial messages (>= length_min_chars).
-    if cfg.length.toggle && (trimmed.chars().count() as i64) >= cfg.length_min_chars {
-        delta += cfg.length.score;
-        notes.push("length".into());
-    }
-
-    // Spam: repeated-char tokens / keyboard mash.
-    if cfg.spam.toggle {
-        let spam = trimmed.split_whitespace().any(|tok| {
-            looks_like_spam_token(tok, cfg.spam_min_token_len, cfg.keyboard_mash_min_len)
-        });
-        if spam {
-            delta += cfg.spam.score;
-            notes.push("spam".into());
+    if cfg.trigram.toggle {
+        let d = check_b(message, cfg);
+        if d != 0 {
+            delta += d;
+            notes.push("trigram".into());
         }
     }
-
-    // No spacing: long message with very few spaces.
-    if cfg.no_spacing.toggle {
-        let len = trimmed.chars().count();
-        let spaces = trimmed.chars().filter(|c| *c == ' ').count();
-        if (len as i64) >= cfg.no_spacing_min_len && spaces == 0 {
-            delta += cfg.no_spacing.score;
-            notes.push("no_spacing".into());
+    if cfg.capital.toggle {
+        let d = check_c(message, cfg);
+        if d != 0 {
+            delta += d;
+            notes.push("capital".into());
         }
     }
-
-    // Wordless: mostly vowel-less tokens.
-    if cfg.wordless.toggle && is_wordless(trimmed, cfg.wordless_vowel_ratio) {
-        delta += cfg.wordless.score;
-        notes.push("wordless".into());
+    if cfg.repeating.toggle {
+        let d = check_d(message, cfg);
+        if d != 0 {
+            delta += d;
+            notes.push("repeating".into());
+        }
     }
-
-    // Emoji: reward messages that include an emoji (engagement).
-    if cfg.emoji.toggle && trimmed.chars().any(is_emoji) {
+    if cfg.space_ratio.toggle {
+        let d = check_e(message, cfg);
+        if d != 0 {
+            delta += d;
+            notes.push("space_ratio".into());
+        }
+    }
+    if cfg.run_on.toggle {
+        let d = check_f(message, cfg);
+        if d != 0 {
+            delta += d;
+            notes.push("run_on".into());
+        }
+    }
+    if cfg.grouping.toggle {
+        let d = check_g(message, cfg);
+        if d != 0 {
+            delta += d;
+            notes.push("grouping".into());
+        }
+    }
+    if cfg.emoji.toggle && message.chars().any(is_emoji) {
         delta += cfg.emoji.score;
         notes.push("emoji".into());
     }
@@ -461,125 +675,167 @@ pub fn score_message(message: &str, cfg: &Config) -> (i64, Vec<String>) {
 mod tests {
     use super::*;
 
-    pub fn all_off() -> Config {
+    fn all_off() -> Config {
         let mut c = default_config();
-        for r in [&mut c.punctuation, &mut c.question, &mut c.length, &mut c.spam, &mut c.no_spacing, &mut c.wordless, &mut c.emoji] {
+        for r in [
+            &mut c.punctuation,
+            &mut c.trigram,
+            &mut c.capital,
+            &mut c.repeating,
+            &mut c.space_ratio,
+            &mut c.run_on,
+            &mut c.grouping,
+            &mut c.emoji,
+        ] {
             r.toggle = false;
         }
         c
     }
 
     #[test]
-    fn punctuation_rewarded() {
-        let c = all_off();
+    fn check_a_rewards_ending_punctuation_and_capitals_after() {
+        let mut c = all_off();
+        c.punctuation.toggle = true;
+        // Ends with "!" and no capital after (nothing after): +20 only.
+        let (delta, notes) = score_message("Hello there!", &c);
+        assert_eq!(delta, 20);
+        assert!(notes.contains(&"punctuation".to_string()));
+        // Ends with "." and a capital within the next 3 chars after the "."
+        let (delta, _) = score_message("Hello there. Welcome back.", &c);
+        assert!(delta >= 20, "expected punctuation reward, got {delta}");
+        // No punctuation: 0.
         let (delta, _) = score_message("hello there", &c);
         assert_eq!(delta, 0);
-        let mut c2 = c.clone();
-        c2.punctuation.toggle = true;
-        let (delta, notes) = score_message("hello there!", &c2);
-        assert_eq!(delta, 1);
-        assert!(notes.contains(&"punctuation".to_string()));
     }
 
     #[test]
-    fn question_rewarded() {
+    fn check_b_counts_valid_trigrams() {
         let mut c = all_off();
-        c.question.toggle = true;
-        let (delta, notes) = score_message("are you ok?", &c);
-        assert_eq!(delta, 2);
-        assert!(notes.contains(&"question".to_string()));
-    }
-
-    #[test]
-    fn length_rewarded_over_40() {
-        let mut c = all_off();
-        c.length.toggle = true;
-        let long = "this is a fairly long message that definitely exceeds forty characters by a bit";
-        let (delta, _) = score_message(long, &c);
-        assert_eq!(delta, 1);
-        let (delta, _) = score_message("short", &c);
+        c.trigram.toggle = true;
+        // "hello" → trigram "hel"; "th" is in the table section.
+        let (delta, notes) = score_message("hello", &c);
+        assert!(delta >= 3, "expected a trigram reward, got {delta}");
+        assert!(notes.contains(&"trigram".to_string()));
+        // A short word with an unlisted trigram scores 0 (or none valid).
+        let (delta, _) = score_message("zz", &c);
         assert_eq!(delta, 0);
     }
 
     #[test]
-    fn spam_punished() {
+    fn check_c_rewards_leading_capital() {
         let mut c = all_off();
-        c.spam.toggle = true;
-        let (delta, notes) = score_message("aaaaaaa llllllll oooooooo", &c);
-        assert_eq!(delta, -5);
-        assert!(notes.contains(&"spam".to_string()));
+        c.capital.toggle = true;
+        let (delta, notes) = score_message("Hello", &c);
+        assert_eq!(delta, 20);
+        assert!(notes.contains(&"capital".to_string()));
+        let (delta, _) = score_message("hello", &c);
+        assert_eq!(delta, -10);
     }
 
     #[test]
-    fn emoji_rewarded() {
+    fn check_d_punishes_repeating_chars() {
+        let mut c = all_off();
+        c.repeating.toggle = true;
+        let (delta, notes) = score_message("aaaaaaa", &c);
+        assert_eq!(delta, -50);
+        assert!(notes.contains(&"repeating".to_string()));
+        let (delta, _) = score_message("hello", &c);
+        assert_eq!(delta, 0);
+    }
+
+    #[test]
+    fn check_e_rewards_good_space_ratio() {
+        let mut c = all_off();
+        c.space_ratio.toggle = true;
+        // 5 spaces / 20 non-space = 25% >= 20% → +20.
+        let (delta, _) = score_message("a b c d e f g", &c);
+        assert_eq!(delta, 20);
+        // 0 spaces → −20.
+        let (delta, _) = score_message("aaaaaaaaaaaa", &c);
+        assert_eq!(delta, -20);
+    }
+
+    #[test]
+    fn check_f_punishes_run_on() {
+        let mut c = all_off();
+        c.run_on.toggle = true;
+        let long = "The stream was great. ".to_string() + &"a".repeat(80);
+        let (delta, notes) = score_message(&long, &c);
+        assert_eq!(delta, -150);
+        assert!(notes.contains(&"run_on".to_string()));
+    }
+
+    #[test]
+    fn check_g_punishes_32_char_groups_without_spaces() {
+        let mut c = all_off();
+        c.grouping.toggle = true;
+        // 33 chars, no spaces: one full 32-char group → −20.
+        let no_space = "a".repeat(33);
+        let (delta, _) = score_message(&no_space, &c);
+        assert_eq!(delta, -20);
+        // 63 chars with a space in the first 32 but none in the second: only
+        // ONE full 32-char group is checked (floor(63/32)=1), and it has a
+        // space, so no penalty.
+        let spaced = "a".repeat(31) + " " + &"b".repeat(31);
+        let (delta, _) = score_message(&spaced, &c);
+        assert_eq!(delta, 0);
+        // 65 chars, space only in the first group: 2 full groups, second has no
+        // space → −20.
+        let spaced2 = "a".repeat(31) + " " + &"b".repeat(33);
+        let (delta, _) = score_message(&spaced2, &c);
+        assert_eq!(delta, -20);
+        // A well-spaced short message: no group reaches 32 → 0.
+        let (delta, _) = score_message("hi there", &c);
+        assert_eq!(delta, 0);
+    }
+
+    #[test]
+    fn emoji_is_optional_extra() {
         let mut c = all_off();
         c.emoji.toggle = true;
-        let (delta, _) = score_message("nice stream 👍", &c);
+        let (delta, notes) = score_message("nice stream 👍", &c);
         assert_eq!(delta, 1);
+        assert!(notes.contains(&"emoji".to_string()));
     }
 
     #[test]
-    fn wordless_punished() {
-        let mut c = all_off();
-        c.wordless.toggle = true;
-        let (delta, _) = score_message("tr th s", &c);
-        assert_eq!(delta, -3);
-    }
-
-    #[test]
-    fn flat_overlay_round_trips_new_tunables() {
+    fn flat_overlay_round_trips_tunables() {
         let cfg = default_config();
         let root = serde_json::json!({});
         let written = flat_map_for_write(&cfg, &root, &serde_json::Map::new());
-        // Defaults are written back for every new tunable key.
-        assert_eq!(written["length_min_chars"], 40);
-        assert_eq!(written["no_spacing_min_len"], 20);
-        assert_eq!(written["spam_min_token_len"], 4);
-        assert_eq!(written["keyboard_mash_min_len"], 5);
-        assert_eq!(written["wordless_vowel_ratio"], 0.5);
-        assert_eq!(written["frequency_interval_floor_secs"], 1);
-        assert_eq!(written["last_msg_cap"], 10_000);
+        assert_eq!(written["run_on_chars"], 75);
+        assert_eq!(written["grouping_size"], 32);
+        assert_eq!(written["space_ratio_pct"], 20);
         assert_eq!(written["prompt_timeout_secs"], 60);
-        assert_eq!(written["reconnect_base_secs"], 1);
-        assert_eq!(written["reconnect_max_secs"], 30);
-        // And read back by the overlay, preserving the defaults.
         let restored = apply_flat_overlay(default_config(), &written);
-        assert_eq!(restored.length_min_chars, 40);
-        assert_eq!(restored.no_spacing_min_len, 20);
-        assert_eq!(restored.spam_min_token_len, 4);
-        assert_eq!(restored.keyboard_mash_min_len, 5);
-        assert_eq!(restored.wordless_vowel_ratio, 0.5);
-        assert_eq!(restored.frequency_interval_floor_secs, 1);
-        assert_eq!(restored.last_msg_cap, 10_000);
-        assert_eq!(restored.prompt_timeout_secs, 60);
-        assert_eq!(restored.reconnect_base_secs, 1);
-        assert_eq!(restored.reconnect_max_secs, 30);
-        // A configured override survives the write → read round trip.
+        assert_eq!(restored.run_on_chars, 75);
+        assert_eq!(restored.grouping_size, 32);
+        assert_eq!(restored.space_ratio_pct, 20);
+        // Overrides survive a round trip.
         let mut overridden = written.clone();
-        overridden.insert("length_min_chars".to_string(), serde_json::json!(99));
-        overridden.insert("reconnect_max_secs".to_string(), serde_json::json!(120));
+        overridden.insert("run_on_chars".to_string(), serde_json::json!(60));
+        overridden.insert("space_ratio_pct".to_string(), serde_json::json!(30));
         let restored = apply_flat_overlay(default_config(), &overridden);
-        assert_eq!(restored.length_min_chars, 99);
-        assert_eq!(restored.reconnect_max_secs, 120);
+        assert_eq!(restored.run_on_chars, 60);
+        assert_eq!(restored.space_ratio_pct, 30);
     }
 
     #[test]
     fn tunables_drive_scoring() {
         let mut c = all_off();
-        // Lower the length bar: a short message now earns the length reward.
-        c.length.toggle = true;
-        c.length_min_chars = 5;
-        let (delta, notes) = score_message("hello", &c);
-        assert_eq!(delta, 1);
-        assert!(notes.contains(&"length".to_string()));
-
-        // Raise the wordless bar so a mildly vowel-less message is not penalized.
-        let mut w = all_off();
-        w.wordless.toggle = true;
-        w.wordless_vowel_ratio = 0.1;
-        assert_eq!(score_message("tr th s ae", &w).0, 0);
-        let mut d = all_off();
-        d.wordless.toggle = true;
-        assert_eq!(score_message("tr th s ae", &d).0, -3);
+        // Lower the space-ratio bar: 1 space in 20 chars (5%) now earns +20.
+        c.space_ratio.toggle = true;
+        c.space_ratio_pct = 5;
+        let (delta, notes) = score_message("a bbbbbbbbbbbbbbbbbbb", &c);
+        assert_eq!(delta, 20);
+        assert!(notes.contains(&"space_ratio".to_string()));
+        // Raise the grouping window to 8 so "hello world" (11 chars) hits a group.
+        let mut g = all_off();
+        g.grouping.toggle = true;
+        g.grouping_size = 8;
+        let (delta, _) = score_message("hello world", &g);
+        assert_eq!(delta, 0); // first 8 chars contain a space → no penalty
+        let (delta, _) = score_message("helloworld", &g);
+        assert_eq!(delta, -20);
     }
 }

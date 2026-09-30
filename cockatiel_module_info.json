@@ -29,78 +29,102 @@
   "credentials": [
     {
       "key": "punctuation_toggle",
-      "label": "Punctuation Toggle",
+      "label": "Punctuation Toggle (AC Check A)",
       "list": false,
       "sensitive": false
     },
     {
       "key": "punctuation_score",
-      "label": "Punctuation Score",
+      "label": "Punctuation Score (AC Check A)",
       "list": false,
       "sensitive": false
     },
     {
-      "key": "question_toggle",
-      "label": "Question Toggle",
+      "key": "trigram_toggle",
+      "label": "Trigram Toggle (AC Check B)",
       "list": false,
       "sensitive": false
     },
     {
-      "key": "question_score",
-      "label": "Question Score",
+      "key": "trigram_score",
+      "label": "Trigram Score (AC Check B)",
       "list": false,
       "sensitive": false
     },
     {
-      "key": "length_toggle",
-      "label": "Length Toggle",
+      "key": "capital_toggle",
+      "label": "Leading Capital Toggle (AC Check C)",
       "list": false,
       "sensitive": false
     },
     {
-      "key": "length_score",
-      "label": "Length Score",
+      "key": "capital_score",
+      "label": "Leading Capital Score (AC Check C)",
       "list": false,
       "sensitive": false
     },
     {
-      "key": "spam_toggle",
-      "label": "Spam Toggle",
+      "key": "repeating_toggle",
+      "label": "Repeating Chars Toggle (AC Check D)",
       "list": false,
       "sensitive": false
     },
     {
-      "key": "spam_score",
-      "label": "Spam Score",
+      "key": "repeating_score",
+      "label": "Repeating Chars Score (AC Check D)",
       "list": false,
       "sensitive": false
     },
     {
-      "key": "no_spacing_toggle",
-      "label": "No Spacing Toggle",
+      "key": "space_ratio_toggle",
+      "label": "Space Ratio Toggle (AC Check E)",
       "list": false,
       "sensitive": false
     },
     {
-      "key": "no_spacing_score",
-      "label": "No Spacing Score",
+      "key": "space_ratio_score",
+      "label": "Space Ratio Score (AC Check E)",
       "list": false,
       "sensitive": false
     },
     {
-      "key": "wordless_toggle",
-      "label": "Wordless Toggle",
+      "key": "run_on_toggle",
+      "label": "Run-on Sentence Toggle (AC Check F)",
       "list": false,
       "sensitive": false
     },
     {
-      "key": "wordless_score",
-      "label": "Wordless Score",
+      "key": "run_on_score",
+      "label": "Run-on Sentence Score (AC Check F)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "grouping_toggle",
+      "label": "32-char Grouping Toggle (AC Check G)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "grouping_score",
+      "label": "32-char Grouping Score (AC Check G)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "emoji_toggle",
+      "label": "Emoji Toggle (chat extra)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "emoji_score",
+      "label": "Emoji Score (chat extra)",
       "list": false,
       "sensitive": false
     }
   ],
-  "description": "preprocess module that scores chat messages contextually (punctuation, questions, length, spam, no-spacing, wordless) and applies the delta to the user's score",
+  "description": "preprocess module that scores chat messages with the Animal Crossing (GCN) letter-scoring algorithm (checks: punctuation, trigrams, leading capital, repeating chars, space ratio, run-on sentences, 32-char groupings; plus an optional emoji bonus) and applies the delta to the user's score",
   "launch_command": "cargo run",
   "name": "score-messages",
   "root_file": "./src/main.rs",

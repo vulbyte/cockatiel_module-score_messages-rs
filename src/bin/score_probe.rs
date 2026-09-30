@@ -36,13 +36,12 @@ const fn Entry(rule: &'static str, text: &'static str) -> CorpusEntry {
     CorpusEntry { rule, text }
 }
 
-/// 100+ curated sentences covering every rule and the neutral baseline.
+/// 100+ curated sentences covering every AC check and the neutral baseline.
 const CORPUS: &[CorpusEntry] = &[
-    // Neutral — plain messages, no rule fires.
+    // Neutral — no AC check fires meaningfully (no capital, no punct, no long runs).
     Entry("neutral", "hey"),
     Entry("neutral", "yo"),
     Entry("neutral", "hi"),
-    Entry("wordless", "gg"),
     Entry("neutral", "lol"),
     Entry("neutral", "nice"),
     Entry("neutral", "cool"),
@@ -50,87 +49,115 @@ const CORPUS: &[CorpusEntry] = &[
     Entry("neutral", "ok"),
     Entry("neutral", "sick"),
     Entry("neutral", "pog"),
-    Entry("neutral", "hi chat"),
-    Entry("neutral", "good game"),
-    Entry("neutral", "lets go"),
-    Entry("neutral", "well played"),
-    // Punctuation — end with . or !.
-    Entry("punctuation", "hello world."),
-    Entry("punctuation", "good morning!"),
-    Entry("punctuation", "what a play."),
-    Entry("punctuation", "see you tomorrow."),
-    Entry("punctuation", "have a good one!"),
-    Entry("punctuation", "this is great."),
-    Entry("punctuation", "that was wild!"),
-    Entry("punctuation", "cant wait for the next one."),
-    Entry("punctuation", "you are doing awesome!"),
-    Entry("punctuation", "the stream is popping off."),
-    Entry("punctuation", "im actually enjoying this a lot."),
-    Entry("punctuation", "that clip is going to be legendary."),
-    // Question — end with ? (also fires punctuation).
-    Entry("question", "how are you?"),
-    Entry("question", "any plans tonight?"),
-    Entry("question", "when does the raid start?"),
-    Entry("question", "can we get a round of applause?"),
-    Entry("question", "did you see that clutch?"),
-    Entry("question", "who is winning right now?"),
-    Entry("question", "whats the music playing in the background?"),
-    Entry("question", "will you play this game again tomorrow?"),
-    Entry("question", "how long have you been streaming for?"),
-    Entry("question", "are we doing the giveaway after this game?"),
-    // Length — 40+ chars.
-    Entry("length", "this is a fairly long message that definitely exceeds forty characters by a bit"),
-    Entry("length", "just wanted to say that this has been one of the most fun streams i have watched in a while now"),
-    Entry("length", "the way you explained that mechanic really helped me understand the game much better than before"),
-    Entry("length", "i have been lurking for a while but this is genuinely the first time i felt like chatting in the stream"),
-    Entry("length", "your consistency with streaming at the same time every day is honestly really impressive to me"),
-    Entry("length", "that play at the end of the match was so clean it made my jaw drop for a solid couple of seconds"),
-    Entry("length", "the community here seems so welcoming compared to some of the other channels i have visited lately"),
-    Entry("length", "hopefully we get to see you try out that new indie game soon because it looks right up your alley"),
-    Entry("length", "i appreciate how you actually read chat and answer questions instead of just ignoring everyone"),
-    Entry("length", "this has to be one of the best comebacks i have seen in competitive play in quite a long time"),
-    // Long + punctuation (two rewards).
-    Entry("length", "that was an absolutely incredible comeback and i am so glad i stayed up to watch the whole thing!"),
-    Entry("length", "the patience you showed while explaining the build order to the new players in chat was great."),
-    // Spam — repeated chars / keyboard mash.
-    Entry("spam", "aaaaaaaaaa"),
-    Entry("spam", "bbbbbbbbbbbb"),
-    Entry("spam", "ccccccccccccccc"),
-    Entry("spam", "ddddddddddddddd"),
-    Entry("spam", "eeeeeeeeeeeeeeee"),
-    Entry("spam", "ffffffffffff"),
-    Entry("spam", "ggggggggggggg"),
-    Entry("spam", "hhhhhhhhhhhhhh"),
-    Entry("spam", "jjjjjjjjjjj"),
-    Entry("spam", "kkkkkkkkkkkkk"),
-    Entry("spam", "asdfghjklqwertyuiopzxcvbnm"),
-    Entry("spam", "qwertyuiopasdfghjkl"),
-    Entry("spam", "zxcvbnmasdfghjklqwertyuiop"),
-    Entry("spam", "poiuytrewqlkjhgfdsa"),
-    Entry("spam", "mnbvcxzlkjhgfdsapoiuytrewq"),
-    // No-spacing — long message, zero spaces.
-    Entry("no_spacing", "thisisareallylongmessagewithnospaceswhatsoeverintheentirething"),
-    Entry("no_spacing", "cantbelieveiwrotethiswithnospacesatallthatscrazy"),
-    Entry("no_spacing", "nospacesinthelongmessageatyalljustonegiantrunonsentence"),
-    Entry("no_spacing", "anothergreatexampleofamessagethathasabsolutelynospaces"),
-    Entry("no_spacing", "thestreamisabsolutelyonfiretonightwithzerochanceofslowingdown"),
-    Entry("no_spacing", "iknowthisisawholerunonmessagebutitstillcountsaschatigues"),
-    Entry("no_spacing", "notasinglespaceistobefoundinthisentirelyunbrokenstringoftext"),
-    Entry("no_spacing", "chatmoveoverbecauseiamabouttotypethelongestwordeverwithoutanybreaks"),
-    Entry("no_spacing", "ifeltlikewritingamessagewithnospacesjusttoseehowitwouldbescored"),
-    Entry("no_spacing", "definitelynotusinganyspacesinthisoneforthesakeoftheexperiment"),
-    // Wordless — mostly vowel-less tokens.
-    Entry("wordless", "tr th s"),
-    Entry("wordless", "qvx zjk"),
-    Entry("wordless", "bdf ghj klm"),
-    Entry("wordless", "qwr tyu iop"),
-    Entry("wordless", "zxv nm"),
-    Entry("wordless", "rty fgh vbn"),
-    Entry("wordless", "lkj hgf dsa"),
-    Entry("wordless", "plm okn ijb"),
-    Entry("wordless", "wqt sdr fgr"),
-    Entry("wordless", "hnj mjk bvc"),
-    // Emoji — includes an emoji.
+    Entry("neutral", "gg"),
+    Entry("neutral", "ye"),
+    Entry("neutral", "yea"),
+    Entry("neutral", "nope"),
+    Entry("neutral", "maybe"),
+    Entry("neutral", "sure"),
+    Entry("neutral", "thanks"),
+    Entry("neutral", "sup"),
+    Entry("neutral", "later"),
+    Entry("neutral", "k"),
+    Entry("neutral", "kk"),
+    // Check A — punctuation: ends with .!? (under 192 chars) and/or capitals after punct.
+    Entry("punctuation", "Hello there."),
+    Entry("punctuation", "Good morning!"),
+    Entry("punctuation", "What a play."),
+    Entry("punctuation", "See you tomorrow."),
+    Entry("punctuation", "Have a good one!"),
+    Entry("punctuation", "This is great."),
+    Entry("punctuation", "That was wild!"),
+    Entry("punctuation", "Cant wait for the next one."),
+    Entry("punctuation", "You are doing awesome!"),
+    Entry("punctuation", "The stream is popping off."),
+    Entry("punctuation", "Im actually enjoying this a lot."),
+    Entry("punctuation", "That clip is going to be legendary."),
+    Entry("punctuation", "How are you?"),
+    Entry("punctuation", "Any plans tonight?"),
+    Entry("punctuation", "Did you see that clutch?"),
+    Entry("punctuation", "Who is winning right now?"),
+    // Check B — trigrams: common word-start trigrams score +3 each.
+    Entry("trigram", "hello"),
+    Entry("trigram", "great"),
+    Entry("trigram", "stream"),
+    Entry("trigram", "thank"),
+    Entry("trigram", "welcome"),
+    Entry("trigram", "please"),
+    Entry("trigram", "better"),
+    Entry("trigram", "little"),
+    Entry("trigram", "really"),
+    Entry("trigram", "people"),
+    Entry("trigram", "think"),
+    Entry("trigram", "coming"),
+    Entry("trigram", "world"),
+    Entry("trigram", "night"),
+    Entry("trigram", "music"),
+    Entry("trigram", "games"),
+    Entry("trigram", "house"),
+    Entry("trigram", "friend"),
+    Entry("trigram", "happy"),
+    Entry("trigram", "water"),
+    // Check C — leading capital: +20 if first non-space char is a capital, else -10.
+    Entry("capital", "Hello"),
+    Entry("capital", "Welcome"),
+    Entry("capital", "Great"),
+    Entry("capital", "Awesome"),
+    Entry("capital", "Perfect"),
+    Entry("capital", "Amazing"),
+    Entry("capital", "Nice"),
+    Entry("capital", "Cool"),
+    Entry("capital", "Thanks"),
+    Entry("capital", "Good"),
+    Entry("capital", "hello"),
+    Entry("capital", "welcome"),
+    Entry("capital", "great"),
+    Entry("capital", "awesome"),
+    Entry("capital", "perfect"),
+    Entry("capital", "amazing"),
+    Entry("capital", "nice"),
+    Entry("capital", "cool"),
+    Entry("capital", "thanks"),
+    Entry("capital", "good"),
+    // Check D — repeating characters: any letter 3+ times sequentially, -50.
+    Entry("repeating", "aaaaaa"),
+    Entry("repeating", "bbbbbbbb"),
+    Entry("repeating", "ccccccccc"),
+    Entry("repeating", "dddddd"),
+    Entry("repeating", "eeeeeee"),
+    Entry("repeating", "ffffff"),
+    Entry("repeating", "ggggg"),
+    Entry("repeating", "hhhhhh"),
+    Entry("repeating", "jjjjjj"),
+    Entry("repeating", "kkkkkk"),
+    Entry("repeating", "abcaaa"),
+    Entry("repeating", "zzzzzz"),
+    // Check E — space ratio: spaces >= 20% of non-spaces, +20, else -20.
+    Entry("space_ratio", "a b c d e f g h i j k l m n o p q r s t u v w x y z"),
+    Entry("space_ratio", "hi there how are you doing today my friend"),
+    Entry("space_ratio", "one two three four five six seven eight nine ten"),
+    Entry("space_ratio", "the quick brown fox jumps over the lazy dog again"),
+    Entry("space_ratio", "lorem ipsum dolor sit amet consectetur adipiscing elit"),
+    Entry("space_ratio", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    Entry("space_ratio", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    Entry("space_ratio", "ccccccccccccccccccccccccccccc"),
+    Entry("space_ratio", "ddddddddddddddddddddddddddddd"),
+    Entry("space_ratio", "eeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+    // Check F — run-on: 75+ chars without punctuation after a punct mark, -150.
+    Entry("run_on", "That was amazing. aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    Entry("run_on", "Great stream. bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    // Check G — 32-char groupings: each 32-char group without a space, -20.
+    Entry("grouping", "thisisareallylongmessagewithnospaceswhatsoeverintheentirething"),
+    Entry("grouping", "cantbelieveiwrotethiswithnospacesatallthatscrazy"),
+    Entry("grouping", "nospacesinthelongmessageatyalljustonegiantrunonsentence"),
+    Entry("grouping", "anothergreatexampleofamessagethathasabsolutelynospaces"),
+    Entry("grouping", "thestreamisabsolutelyonfiretonightwithzerochanceofslowingdown"),
+    Entry("grouping", "iknowthisisawholerunonmessagebutitstillcountsaschatigues"),
+    Entry("grouping", "notasinglespaceistobefoundinthisentirelyunbrokenstringoftext"),
+    Entry("grouping", "chatmoveoverbecauseiamabouttotypethelongestwordeverwithoutanybreaks"),
+    Entry("grouping", "ifeltlikewritingamessagewithnospacesjusttoseehowitwouldbescored"),
+    Entry("grouping", "definitelynotusinganyspacesinthisoneforthesakeoftheexperiment"),
+    // Emoji — chat extra (+1).
     Entry("emoji", "nice stream 👍"),
     Entry("emoji", "lol 😂"),
     Entry("emoji", "poggers 🚀"),
@@ -141,28 +168,13 @@ const CORPUS: &[CorpusEntry] = &[
     Entry("emoji", "lets gooo 💪"),
     Entry("emoji", "that was insane 🤯"),
     Entry("emoji", "good vibes ✨"),
-    // Emoji + punctuation (two rewards).
-    Entry("emoji", "absolutely insane play tonight 🔥!"),
-    Entry("emoji", "cant wait for tomorrows stream 🎉."),
-    // Combos — fire several rules at once.
-    Entry("length", "hey everyone just wanted to say the stream has been fantastic tonight and i am really enjoying the energy here!"),
-    Entry("question", "does anyone else think the new update to the game is actually really good and well worth trying out?"),
-    Entry("emoji", "what a night for the community 🔥 what a night for the community 🔥 what a night for the community!"),
-    Entry("wordless", "k"),
-    Entry("wordless", "kk"),
-    Entry("neutral", "ye"),
-    Entry("neutral", "yea"),
-    Entry("neutral", "nope"),
-    Entry("neutral", "maybe"),
-    Entry("neutral", "sure"),
-    Entry("neutral", "thanks"),
-    Entry("wordless", "ty"),
-    Entry("wordless", "thx"),
-    Entry("neutral", "sup"),
-    Entry("neutral", "later"),
-    Entry("wordless", "brb"),
-    Entry("wordless", "gtg"),
+    // Well-formed messages (combos): several checks fire positively.
+    Entry("punctuation", "Hello everyone. Welcome to the stream!"),
+    Entry("punctuation", "That was an absolutely incredible comeback and I am so glad I stayed up to watch!"),
+    Entry("punctuation", "The patience you showed while explaining the build order was great."),
+    Entry("punctuation", "Does anyone else think the new update is really good and worth trying out?"),
 ];
+
 
 /// A scored corpus sentence.
 struct Scored {
@@ -240,12 +252,13 @@ fn print_histogram(label: &str, scored: &[Scored]) {
 fn print_per_rule(scored: &[Scored], config: &Config) {
     println!("\n=== Per-rule contribution (across the whole corpus) ===");
     let rules = [
-        ("punctuation", "end with . ! ?".to_string(), config.punctuation.toggle),
-        ("question", "end with ?".to_string(), config.question.toggle),
-        ("length", format!(">= {} chars", config.length_min_chars), config.length.toggle),
-        ("spam", "repeated chars / mash".to_string(), config.spam.toggle),
-        ("no_spacing", format!(">= {} chars, no spaces", config.no_spacing_min_len), config.no_spacing.toggle),
-        ("wordless", "mostly vowel-less".to_string(), config.wordless.toggle),
+        ("punctuation", "ends with .!? / caps after punct".to_string(), config.punctuation.toggle),
+        ("trigram", "valid word-start trigrams".to_string(), config.trigram.toggle),
+        ("capital", "leading capital".to_string(), config.capital.toggle),
+        ("repeating", "letter repeated 3+ times".to_string(), config.repeating.toggle),
+        ("space_ratio", format!("spaces >= {}% of non-space", config.space_ratio_pct), config.space_ratio.toggle),
+        ("run_on", format!("{}+ chars w/o punctuation", config.run_on_chars), config.run_on.toggle),
+        ("grouping", format!("{}-char group w/o space", config.grouping_size), config.grouping.toggle),
         ("emoji", "includes emoji".to_string(), config.emoji.toggle),
     ];
     println!(
@@ -372,23 +385,20 @@ fn embedded_sentences() -> Vec<String> {
 fn print_config_summary(config: &Config) {
     println!("--- config ---");
     println!(
-        "punct={:+} q={:+} len={:+} spam={:+} nospace={:+} wordless={:+} emoji={:+} freq={:+}",
+        "punct={:+} trigram={:+} capital={:+} repeat={:+} space_ratio={:+} run_on={:+} grouping={:+} emoji={:+} freq={:+}",
         config.punctuation.score,
-        config.question.score,
-        config.length.score,
-        config.spam.score,
-        config.no_spacing.score,
-        config.wordless.score,
+        config.trigram.score,
+        config.capital.score,
+        config.repeating.score,
+        config.space_ratio.score,
+        config.run_on.score,
+        config.grouping.score,
         config.emoji.score,
         config.frequency.score
     );
     println!(
-        "length_min_chars={} no_spacing_min_len={} spam_min_token_len={} mash_min_len={} wordless_ratio={}",
-        config.length_min_chars,
-        config.no_spacing_min_len,
-        config.spam_min_token_len,
-        config.keyboard_mash_min_len,
-        config.wordless_vowel_ratio
+        "run_on_chars={} grouping_size={} space_ratio_pct={}%",
+        config.run_on_chars, config.grouping_size, config.space_ratio_pct
     );
 }
 
@@ -471,11 +481,12 @@ fn main() {
         // Per-rule contribution delta.
         let rules = [
             "punctuation",
-            "question",
-            "length",
-            "spam",
-            "no_spacing",
-            "wordless",
+            "trigram",
+            "capital",
+            "repeating",
+            "space_ratio",
+            "run_on",
+            "grouping",
             "emoji",
         ];
         println!("\n{:<14} {:>10} {:>10} {:>+10}", "rule", "baseline", diff, "contrib shift");
@@ -507,8 +518,8 @@ mod tests {
     #[test]
     fn every_corpus_tag_is_a_real_rule() {
         let known = [
-            "neutral", "punctuation", "question", "length", "spam",
-            "no_spacing", "wordless", "emoji",
+            "neutral", "punctuation", "trigram", "capital", "repeating",
+            "space_ratio", "run_on", "grouping", "emoji",
         ];
         for e in CORPUS {
             assert!(
@@ -520,26 +531,32 @@ mod tests {
     }
 
     #[test]
-    fn neutral_sentences_score_zero_with_production_defaults() {
+    fn neutral_sentences_reflect_ac_penalties() {
         let cfg = default_config();
+        // Under the AC algorithm a short lowercase message is penalised for
+        // lacking a leading capital (C: −10) and a good space ratio (E: −20).
         for e in CORPUS.iter().filter(|e| e.rule == "neutral") {
             let (delta, notes) = score_message(e.text, &cfg);
-            assert_eq!(delta, 0, "neutral '{}' scored {delta} ({notes:?})", e.text);
+            assert!(delta <= 0, "neutral '{}' scored positive {delta} ({notes:?})", e.text);
         }
     }
 
     #[test]
-    fn production_defaults_punish_spam_and_wordless() {
+    fn production_defaults_punish_repeating_chars() {
         let cfg = default_config();
-        let spam = CORPUS.iter().find(|e| e.rule == "spam").unwrap();
-        let (delta, notes) = score_message(spam.text, &cfg);
-        assert!(delta < 0, "spam '{}' should be punished, got {delta}", spam.text);
-        assert!(notes.contains(&"spam".to_string()));
+        let repeating = CORPUS.iter().find(|e| e.rule == "repeating").unwrap();
+        let (delta, notes) = score_message(repeating.text, &cfg);
+        assert!(delta < 0, "repeating '{}' should be punished, got {delta}", repeating.text);
+        assert!(notes.contains(&"repeating".to_string()));
+    }
 
-        let wordless = CORPUS.iter().find(|e| e.rule == "wordless").unwrap();
-        let (delta, notes) = score_message(wordless.text, &cfg);
-        assert!(delta < 0, "wordless '{}' should be punished, got {delta}", wordless.text);
-        assert!(notes.contains(&"wordless".to_string()));
+    #[test]
+    fn production_defaults_reward_punctuation() {
+        let cfg = default_config();
+        let punct = CORPUS.iter().find(|e| e.rule == "punctuation").unwrap();
+        let (delta, notes) = score_message(punct.text, &cfg);
+        assert!(delta > 0, "punctuation '{}' should be rewarded, got {delta}", punct.text);
+        assert!(notes.contains(&"punctuation".to_string()));
     }
 
     #[test]
@@ -564,15 +581,15 @@ mod tests {
         let path = "/tmp/probe_load_config_test.json";
         std::fs::write(
             path,
-            r#"{"ip":"127.0.0.1","module_specific":{"spam_score":-12,"question_score":7}}"#,
+            r#"{"ip":"127.0.0.1","module_specific":{"repeating_score":-60,"run_on_score":200}}"#,
         )
         .unwrap();
         let cfg = load_config(Some(path));
-        assert_eq!(cfg.spam.score, -12);
-        assert_eq!(cfg.question.score, 7);
+        assert_eq!(cfg.repeating.score, -60);
+        assert_eq!(cfg.run_on.score, 200);
         // Unmentioned keys fall back to production defaults.
-        assert_eq!(cfg.emoji.score, 1);
-        assert_eq!(cfg.length_min_chars, 40);
+        assert_eq!(cfg.punctuation.score, 20);
+        assert_eq!(cfg.trigram.score, 3);
         let _ = std::fs::remove_file(path);
     }
 

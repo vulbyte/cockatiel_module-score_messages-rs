@@ -16,8 +16,31 @@ delta to the user's score:
 | F. Run-on sentence | 75+ chars without punctuation after a punct mark | −150 |
 | G. 32-char groupings | each 32-char group with no space | −20 each |
 
-Plus an optional chat-specific **emoji** bonus (+1, toggleable) and the
-time-based **frequency** anti-spam rule.
+Plus an optional chat-specific **emoji** bonus (+1, toggleable), the
+time-based **frequency** anti-spam rule, and a **viewership multiplier** that
+scales the final delta by how small the current audience is.
+
+## Viewership multiplier
+
+When enabled, the module polls the engine's `channel_viewers` surface every
+`viewership_poll_secs` and uses the **peak** viewer count across all platforms
+(e.g. youtube=7, twitch=3, discord=5 → 7). The score delta is scaled by:
+
+```
+multiplier = clamp(max_viewers / viewers, 1.0, multiplier_max)
+```
+
+So a small stream rewards interaction more (fewer viewers → a higher
+multiplier, up to `viewership_multiplier_max`), giving large streamers more
+room to breathe. `viewers = 0` (offline) uses the ceiling. Disabled by default;
+enable with `viewership_toggle` in `config.json`.
+
+| Key | Default | What it controls |
+|-----|---------|------------------|
+| `viewership_toggle` | `false` | enable/disable the multiplier |
+| `viewership_max_viewers` | `1000` | viewer count where the multiplier is 1.0 |
+| `viewership_multiplier_max` | `5.0` | largest multiplier ever applied (clamp) |
+| `viewership_poll_secs` | `30` | how often to re-query the engine for viewer counts |
 
 ## Dependencies
 

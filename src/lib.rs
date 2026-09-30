@@ -111,6 +111,24 @@ pub struct Config {
     /// Punish posting again too soon after a user's last message.
     #[serde(default)]
     pub frequency: FrequencyRule,
+    // ── Viewership multiplier ───────────────────────────────────────────
+    /// Scale the score delta by a viewership factor: small streams reward
+    /// interaction more (multiplier = max_viewers / viewers, clamped to
+    /// `viewership_multiplier_max`), so large streamers get more room to
+    /// breathe. Disabled by default.
+    #[serde(default)]
+    pub viewership_toggle: bool,
+    /// The reference viewer count where the multiplier is 1.0 (the streamer's
+    /// "full house"). Fewer viewers → a higher multiplier.
+    #[serde(default = "default_viewership_max_viewers")]
+    pub viewership_max_viewers: i64,
+    /// The largest multiplier ever applied (clamp). 0 viewers (offline) also
+    /// uses this ceiling.
+    #[serde(default = "default_viewership_multiplier_max")]
+    pub viewership_multiplier_max: f64,
+    /// How often (seconds) the module re-queries the engine for viewer counts.
+    #[serde(default = "default_viewership_poll_secs")]
+    pub viewership_poll_secs: u64,
     // ── Tunable scalars (defaults match the game's algorithm) ───────────
     #[serde(default = "default_run_on_chars")]
     pub run_on_chars: usize,
@@ -174,6 +192,16 @@ fn default_emoji() -> Rule {
     Rule { toggle: true, score: 1 }
 }
 
+pub fn default_viewership_max_viewers() -> i64 {
+    1000
+}
+pub fn default_viewership_multiplier_max() -> f64 {
+    5.0
+}
+pub fn default_viewership_poll_secs() -> u64 {
+    30
+}
+
 pub fn default_run_on_chars() -> usize {
     RUN_ON_CHARS
 }
@@ -228,6 +256,10 @@ pub fn default_config() -> Config {
         grouping: default_grouping(),
         emoji: default_emoji(),
         frequency: FrequencyRule::default(),
+        viewership_toggle: false,
+        viewership_max_viewers: default_viewership_max_viewers(),
+        viewership_multiplier_max: default_viewership_multiplier_max(),
+        viewership_poll_secs: default_viewership_poll_secs(),
         run_on_chars: default_run_on_chars(),
         grouping_size: default_grouping_size(),
         space_ratio_pct: default_space_ratio_pct(),
@@ -337,6 +369,18 @@ pub fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_js
     apply_rule!(grouping, "grouping");
     apply_rule!(emoji, "emoji");
     apply_rule!(frequency, "frequency");
+    if let Some(t) = parse_toggle(ms.get("viewership_toggle")) {
+        cfg.viewership_toggle = t;
+    }
+    if let Some(v) = parse_score(ms.get("viewership_max_viewers")) {
+        cfg.viewership_max_viewers = v;
+    }
+    if let Some(v) = parse_f64(ms.get("viewership_multiplier_max")) {
+        cfg.viewership_multiplier_max = v;
+    }
+    if let Some(v) = parse_u64(ms.get("viewership_poll_secs")) {
+        cfg.viewership_poll_secs = v;
+    }
     if let Some(i) = parse_u64(ms.get("frequency_interval_secs")) {
         cfg.frequency.interval_secs = i;
     }
@@ -416,6 +460,30 @@ pub fn flat_map_for_write(
     put_rule!(grouping, "grouping");
     put_rule!(emoji, "emoji");
     put_rule!(frequency, "frequency");
+    out.insert(
+        "viewership_toggle".to_string(),
+        serde_json::Value::Bool(
+            parse_toggle(ms.get("viewership_toggle")).unwrap_or(cfg.viewership_toggle),
+        ),
+    );
+    out.insert(
+        "viewership_max_viewers".to_string(),
+        serde_json::json!(
+            parse_score(ms.get("viewership_max_viewers")).unwrap_or(cfg.viewership_max_viewers)
+        ),
+    );
+    out.insert(
+        "viewership_multiplier_max".to_string(),
+        serde_json::json!(
+            parse_f64(ms.get("viewership_multiplier_max")).unwrap_or(cfg.viewership_multiplier_max)
+        ),
+    );
+    out.insert(
+        "viewership_poll_secs".to_string(),
+        serde_json::json!(
+            parse_u64(ms.get("viewership_poll_secs")).unwrap_or(cfg.viewership_poll_secs)
+        ),
+    );
     let interval = parse_u64(ms.get("frequency_interval_secs")).unwrap_or(cfg.frequency.interval_secs);
     out.insert("frequency_interval_secs".to_string(), serde_json::json!(interval));
     macro_rules! put_scalar {
@@ -741,6 +809,21 @@ pub fn score_message(message: &str, cfg: &Config) -> (i64, Vec<String>) {
     (delta, notes)
 }
 
+/// The viewership multiplier for a score delta: `max_viewers / viewers`,
+/// clamped to `[1.0, viewership_multiplier_max]`. Fewer viewers → a higher
+/// multiplier, so interaction on a small stream is rewarded more and a large
+/// stream gets more breathing room. `viewers == 0` (channel offline) uses the
+/// ceiling. Returns `1.0` when the viewership modifier is disabled.
+pub fn viewership_multiplier(cfg: &Config, viewers: i64) -> f64 {
+    if !cfg.viewership_toggle {
+        return 1.0;
+    }
+    let max_viewers = cfg.viewership_max_viewers.max(1);
+    let viewers = viewers.max(1); // 0/offline treated as the smallest audience
+    let raw = max_viewers as f64 / viewers as f64;
+    raw.clamp(1.0, cfg.viewership_multiplier_max.max(1.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,6 +966,10 @@ mod tests {
         assert_eq!(written["repeating_threshold"], 3);
         assert_eq!(written["run_on_window"], 76);
         assert_eq!(written["prompt_timeout_secs"], 60);
+        assert_eq!(written["viewership_toggle"], false);
+        assert_eq!(written["viewership_max_viewers"], 1000);
+        assert_eq!(written["viewership_multiplier_max"], 5.0);
+        assert_eq!(written["viewership_poll_secs"], 30);
         let restored = apply_flat_overlay(default_config(), &written);
         assert_eq!(restored.run_on_chars, 75);
         assert_eq!(restored.grouping_size, 32);
@@ -892,17 +979,27 @@ mod tests {
         assert_eq!(restored.capital_penalty, 10);
         assert_eq!(restored.repeating_threshold, 3);
         assert_eq!(restored.run_on_window, 76);
+        assert!(!restored.viewership_toggle);
+        assert_eq!(restored.viewership_max_viewers, 1000);
+        assert_eq!(restored.viewership_multiplier_max, 5.0);
+        assert_eq!(restored.viewership_poll_secs, 30);
         // Overrides survive a round trip.
         let mut overridden = written.clone();
         overridden.insert("run_on_chars".to_string(), serde_json::json!(60));
         overridden.insert("space_ratio_pct".to_string(), serde_json::json!(30));
         overridden.insert("punct_capital_bonus".to_string(), serde_json::json!(25));
         overridden.insert("repeating_threshold".to_string(), serde_json::json!(5));
+        overridden.insert("viewership_toggle".to_string(), serde_json::json!(true));
+        overridden.insert("viewership_max_viewers".to_string(), serde_json::json!(500));
+        overridden.insert("viewership_multiplier_max".to_string(), serde_json::json!(2.5));
         let restored = apply_flat_overlay(default_config(), &overridden);
         assert_eq!(restored.run_on_chars, 60);
         assert_eq!(restored.space_ratio_pct, 30);
         assert_eq!(restored.punct_capital_bonus, 25);
         assert_eq!(restored.repeating_threshold, 5);
+        assert!(restored.viewership_toggle);
+        assert_eq!(restored.viewership_max_viewers, 500);
+        assert_eq!(restored.viewership_multiplier_max, 2.5);
     }
 
     #[test]
@@ -936,5 +1033,44 @@ mod tests {
         cp.capital_penalty = 3;
         let (delta, _) = score_message("hello", &cp);
         assert_eq!(delta, -3);
+    }
+
+    #[test]
+    fn viewership_multiplier_is_disabled_by_default() {
+        let cfg = default_config();
+        assert_eq!(viewership_multiplier(&cfg, 0), 1.0);
+        assert_eq!(viewership_multiplier(&cfg, 5000), 1.0);
+    }
+
+    #[test]
+    fn viewership_multiplier_rewards_small_streams() {
+        let mut cfg = default_config();
+        cfg.viewership_toggle = true;
+        cfg.viewership_max_viewers = 1000;
+        cfg.viewership_multiplier_max = 5.0;
+        // At "full house" the multiplier is 1.0.
+        assert_eq!(viewership_multiplier(&cfg, 1000), 1.0);
+        // Half the audience → 2x.
+        assert_eq!(viewership_multiplier(&cfg, 500), 2.0);
+        // A tenth of the audience → 10x, clamped to the ceiling of 5.
+        assert_eq!(viewership_multiplier(&cfg, 100), 5.0);
+        // Offline (0 viewers) → the ceiling.
+        assert_eq!(viewership_multiplier(&cfg, 0), 5.0);
+    }
+
+    #[test]
+    fn viewership_multiplier_clamps_and_respects_ceiling() {
+        let mut cfg = default_config();
+        cfg.viewership_toggle = true;
+        cfg.viewership_max_viewers = 2000;
+        cfg.viewership_multiplier_max = 3.0;
+        // More viewers than max → the multiplier never dips below 1.0.
+        assert_eq!(viewership_multiplier(&cfg, 9000), 1.0);
+        // Large audience still clamps to the ceiling at the low end.
+        assert_eq!(viewership_multiplier(&cfg, 2000), 1.0);
+        // A small audience clamps to the configured ceiling, not an unlimited one.
+        assert_eq!(viewership_multiplier(&cfg, 1), 3.0);
+        // Negative viewers (defensive) behave like offline → ceiling.
+        assert_eq!(viewership_multiplier(&cfg, -5), 3.0);
     }
 }

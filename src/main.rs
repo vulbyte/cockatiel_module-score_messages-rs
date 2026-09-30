@@ -10,7 +10,10 @@ use tracing_subscriber::FmtSubscriber;
 
 use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient, PromptKind};
 
-use score_messages_rs::{apply_flat_overlay, default_config, flat_map_for_write, score_message, Config};
+use score_messages_rs::{
+    apply_flat_overlay, default_config, flat_map_for_write, score_message, viewership_multiplier,
+    Config,
+};
 
 type WsWriteHalf = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<
@@ -261,6 +264,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Arc<Mutex> that is populated right after load_config returns.
     let config_shared: Arc<Mutex<Config>> = Arc::new(Mutex::new(default_config()));
 
+    // Cached peak viewer count across platforms (fed by the viewer-poll task,
+    // used to scale score deltas by the viewership multiplier).
+    let viewers_shared: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
+
     // Read task: forward PromptResponses to the awaiting prompt AND handle
     // message pre-processing. Spawned BEFORE load_config so prompts work.
     // Owns the read half + session identity so it can reconnect with backoff
@@ -269,6 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let prompt_tx_task = prompt_tx.clone();
         let config_shared = Arc::clone(&config_shared);
+        let viewers_shared = Arc::clone(&viewers_shared);
         let write_shared = Arc::clone(&write_shared);
         let mut auth_token = auth_token.clone();
         let mut module_name = module_name.clone();
@@ -380,6 +388,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if delta != 0 && !uuid.is_empty() {
+                                // Apply the viewership multiplier: small streams
+                                // reward interaction more (peak viewers → a higher
+                                // factor up to the configured ceiling). Disabled
+                                // when viewership_toggle is off.
+                                if config.viewership_toggle {
+                                    let viewers = *viewers_shared.lock().unwrap();
+                                    let mult = viewership_multiplier(&config, viewers);
+                                    delta = ((delta as f64) * mult).round() as i64;
+                                    if delta != 0 {
+                                        notes.push(format!("viewership x{mult:.2}"));
+                                    }
+                                }
                                 // Apply the real signed delta via the engine's
                                 // score-only virtual query (no ±1 clamp, no
                                 // rating-counter inflation, no cooldown).
@@ -465,6 +485,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             backoff = (backoff * 2).min(reconnect_cfg.reconnect_max_secs);
                         }
                     }
+                }
+            }
+        });
+    }
+
+    // Viewer-poll task: every `viewership_poll_secs`, query the engine's
+    // `channel_viewers` surface and cache the peak viewer count across all
+    // platforms. Runs its own connection (the read task owns the main socket).
+    // The multiplier only applies when the viewership modifier is enabled, so
+    // the task is cheap when off (single query per interval, best-effort).
+    {
+        let viewers_shared = Arc::clone(&viewers_shared);
+        let config_shared = Arc::clone(&config_shared);
+        tokio::spawn(async move {
+            let mut poll = config_shared.lock().unwrap().viewership_poll_secs.max(1);
+            loop {
+                tokio::time::sleep(Duration::from_secs(poll)).await;
+                // Re-read the poll interval from the live config on each cycle.
+                poll = config_shared.lock().unwrap().viewership_poll_secs.max(1);
+                if let Ok(conn) = CockatielClient::connect("config.json").await {
+                    let (w, mut r) = conn.stream.split();
+                        let write = Arc::new(AsyncMutex::new(w));
+                        let query = Container {
+                            version: 1,
+                            auth_token: conn.auth_token.clone(),
+                            module_name: conn.config.module_name.clone(),
+                            module_instance_uuid7: conn.instance_uuid7.clone(),
+                            payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                                query_id: "channel_viewers".to_string(),
+                                sql: "{}".to_string(),
+                                params: vec![],
+                            })),
+                        };
+                        send_container(&write, query).await;
+                        // Wait briefly for the answer, answering liveness probes.
+                        let deadline = tokio::time::Instant::now()
+                            + Duration::from_secs((poll * 2).max(10));
+                        while tokio::time::Instant::now() < deadline {
+                            let Ok(Some(msg)) = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                r.next(),
+                            )
+                            .await
+                            else {
+                                break;
+                            };
+                            let Ok(WsMessage::Binary(d)) = msg else { continue };
+                            let Ok(c) = Container::decode(d.as_ref()) else { continue };
+                            match c.payload {
+                                Some(Payload::AuthVerify(_)) => {
+                                    let reply = Container {
+                                        version: 1,
+                                        auth_token: conn.auth_token.clone(),
+                                        module_name: conn.config.module_name.clone(),
+                                        module_instance_uuid7: conn.instance_uuid7.clone(),
+                                        payload: Some(Payload::AuthVerify(AuthVerify {
+                                            cur_auth: conn.auth_token.clone(),
+                                        })),
+                                    };
+                                    send_container(&write, reply).await;
+                                }
+                                Some(Payload::DatabaseQueryResult(res)) => {
+                                    // Peak viewer count across all channels.
+                                    let mut peak = 0i64;
+                                    if let Ok(json) =
+                                        serde_json::from_slice::<serde_json::Value>(&res.result_blob)
+                                    {
+                                        if let Some(channels) =
+                                            json.get("channels").and_then(|c| c.as_array())
+                                        {
+                                            for ch in channels {
+                                                if let Some(v) = ch
+                                                    .get("viewers")
+                                                    .and_then(|v| v.as_i64())
+                                                {
+                                                    peak = peak.max(v);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    *viewers_shared.lock().unwrap() = peak;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        drop(r);
                 }
             }
         });

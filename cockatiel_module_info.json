@@ -112,6 +112,30 @@
       "sensitive": false
     },
     {
+      "key": "viewership_toggle",
+      "label": "Viewership Multiplier Toggle",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "viewership_max_viewers",
+      "label": "Viewership Max Viewers (multiplier=1.0 at this count)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "viewership_multiplier_max",
+      "label": "Viewership Multiplier Ceiling",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "viewership_poll_secs",
+      "label": "Viewership Poll Interval (secs)",
+      "list": false,
+      "sensitive": false
+    },
+    {
       "key": "emoji_toggle",
       "label": "Emoji Toggle (chat extra)",
       "list": false,

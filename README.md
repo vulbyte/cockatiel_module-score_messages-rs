@@ -23,9 +23,25 @@ scales the final delta by how small the current audience is.
 ## External trigram table
 
 Check B normally uses the built-in game-accurate (bugged) trigram tables. To
-import your own, set `trigram_table_path` in `config.json` to a CSV, JSON, or
-text file (relative to the module's working directory). The file is read at
-startup and cached by path.
+import your own, set `trigram_table_path` in the module's `config.json` under
+`module_specific` to a CSV, JSON, or text file (relative to the module's
+working directory). The file is read at startup and cached by path.
+
+**Where to paste the path:** edit `config.json` in this directory (open the
+score-messages module row in the TUI and press `e`, or edit the file directly)
+and set:
+
+```json
+"module_specific": {
+  "trigram_table_path": "./trigrams.csv",
+  "trigram_toggle": true,
+  "trigram_score": 3
+}
+```
+
+`config.example.json` shows the full file with the path filled in, and
+`trigrams.example.csv` is a ready-made table you can copy and extend. The path
+is relative to the module's directory, or absolute (e.g. `/home/you/trigrams.json`).
 
 Supported formats (chosen by file extension):
 

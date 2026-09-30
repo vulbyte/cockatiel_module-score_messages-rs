@@ -1,4 +1,5 @@
 {
+  "authority": 0,
   "autostart": true,
   "binary": {
     "linux": {
@@ -48,6 +49,12 @@
     {
       "key": "trigram_score",
       "label": "Trigram Score (AC Check B)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "trigram_table_path",
+      "label": "External Trigram Table Path (CSV/JSON/txt; empty = built-in)",
       "list": false,
       "sensitive": false
     },
@@ -204,10 +211,9 @@
   ],
   "description": "preprocess module that scores chat messages with the Animal Crossing (GCN) letter-scoring algorithm (checks: punctuation, trigrams, leading capital, repeating chars, space ratio, run-on sentences, 32-char groupings; plus an optional emoji bonus) and applies the delta to the user's score",
   "launch_command": "cargo run",
-  "name": "score-messages",
-  "root_file": "./src/main.rs",
-  "version": "0.1.0",
-  "price": 0,
   "min_rank": 0,
-  "authority": 0
+  "name": "score-messages",
+  "price": 0,
+  "root_file": "./src/main.rs",
+  "version": "0.1.0"
 }

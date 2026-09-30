@@ -89,6 +89,10 @@ pub struct Config {
     /// Check B: valid trigrams.
     #[serde(default = "default_trigram")]
     pub trigram: Rule,
+    /// Path to an external trigram table (CSV, JSON, or `~X~`-sectioned text).
+    /// Empty = use the embedded game-accurate (bugged) table.
+    #[serde(default)]
+    pub trigram_table_path: String,
     /// Check C: leading capital.
     #[serde(default = "default_capital")]
     pub capital: Rule,
@@ -249,6 +253,7 @@ pub fn default_config() -> Config {
     Config {
         punctuation: Rule { toggle: true, score: 20 },
         trigram: default_trigram(),
+        trigram_table_path: String::new(),
         capital: default_capital(),
         repeating: default_repeating(),
         space_ratio: default_space_ratio(),
@@ -362,6 +367,9 @@ pub fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_js
     }
     apply_rule!(punctuation, "punctuation");
     apply_rule!(trigram, "trigram");
+    if let Some(p) = ms.get("trigram_table_path").and_then(|v| v.as_str()) {
+        cfg.trigram_table_path = p.to_string();
+    }
     apply_rule!(capital, "capital");
     apply_rule!(repeating, "repeating");
     apply_rule!(space_ratio, "space_ratio");
@@ -453,6 +461,12 @@ pub fn flat_map_for_write(
     }
     put_rule!(punctuation, "punctuation");
     put_rule!(trigram, "trigram");
+    out.insert(
+        "trigram_table_path".to_string(),
+        serde_json::json!(ms.get("trigram_table_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&cfg.trigram_table_path)),
+    );
     put_rule!(capital, "capital");
     put_rule!(repeating, "repeating");
     put_rule!(space_ratio, "space_ratio");
@@ -619,37 +633,240 @@ fn trigram_lines() -> &'static [&'static str] {
     })
 }
 
+/// A loaded external trigram table: `first_letter` → the 2-char suffixes that
+/// form a valid trigram. Unlike the embedded table (which replicates the game's
+/// section-scan bug), an external table matches strictly within its own
+/// letter's section — predictable for user-imported data.
+#[derive(Debug, Clone, Default)]
+pub struct TrigramTable {
+    suffixes: std::collections::HashMap<char, std::collections::HashSet<String>>,
+}
+
+impl TrigramTable {
+    /// Load a trigram table from a file. Supported formats (chosen by
+    /// extension):
+    ///
+    /// - `.json` — either an array of full 3-char trigrams
+    ///   `["the", "and", ...]`, or an object mapping a letter to its 2-char
+    ///   suffixes `{"t": ["he", "hr"], ...}`.
+    /// - `.csv` — rows of `letter,suffix` pairs, or full 3-char trigrams
+    ///   (single column). A header row is skipped.
+    /// - anything else (`.txt`, the game's own format) — `~X~` section
+    ///   headers followed by one 2-char suffix per line.
+    pub fn load(path: &str) -> Result<Self, String> {
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| format!("read trigram table {}: {e}", path))?;
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".json") {
+            Self::from_json(&data)
+        } else if lower.ends_with(".csv") {
+            Self::from_csv(&data)
+        } else {
+            Self::from_text(&data)
+        }
+    }
+
+    /// Parse table content given a filename (used by tests without touching
+    /// the filesystem).
+    pub fn load_from_str(data: &str, filename: &str) -> Result<Self, String> {
+        let lower = filename.to_ascii_lowercase();
+        if lower.ends_with(".json") {
+            Self::from_json(data)
+        } else if lower.ends_with(".csv") {
+            Self::from_csv(data)
+        } else {
+            Self::from_text(data)
+        }
+    }
+
+    fn from_json(data: &str) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(data).map_err(|e| format!("invalid JSON trigram table: {e}"))?;
+        let mut table = Self::default();
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    let s = item.as_str().ok_or("JSON trigram table rows must be strings")?;
+                    table.insert_trigram(s)?;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (letter, suffixes) in map {
+                    let letter = letter
+                        .trim()
+                        .chars()
+                        .next()
+                        .ok_or("empty letter key in JSON trigram table")?
+                        .to_ascii_uppercase();
+                    let suffixes = suffixes
+                        .as_array()
+                        .ok_or("JSON letter values must be arrays of suffixes")?;
+                    for s in suffixes {
+                        let suffix = s
+                            .as_str()
+                            .ok_or("JSON suffix values must be strings")?
+                            .trim()
+                            .to_string();
+                        table.suffixes.entry(letter).or_default().insert(suffix);
+                    }
+                }
+            }
+            _ => return Err("JSON trigram table must be an array or object".to_string()),
+        }
+        Ok(table)
+    }
+
+    fn from_csv(data: &str) -> Result<Self, String> {
+        let mut table = Self::default();
+        for (i, line) in data.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(',').map(|p| p.trim()).collect();
+            if parts.len() == 1 && i == 0 && parts[0].eq_ignore_ascii_case("trigram") {
+                continue; // header row: "trigram"
+            }
+            if parts.len() == 2 && i == 0
+                && parts[0].eq_ignore_ascii_case("letter")
+                && parts[1].eq_ignore_ascii_case("suffix")
+            {
+                continue; // header row: "letter,suffix"
+            }
+            if parts.len() >= 2 {
+                let letter = parts[0]
+                    .chars()
+                    .next()
+                    .ok_or("empty letter in CSV trigram row")?
+                    .to_ascii_uppercase();
+                let suffix = parts[1].to_string();
+                table.suffixes.entry(letter).or_default().insert(suffix);
+            } else if let Some(tri) = parts.first() {
+                table.insert_trigram(tri)?;
+            }
+        }
+        Ok(table)
+    }
+
+    fn from_text(data: &str) -> Result<Self, String> {
+        let mut table = Self::default();
+        let mut current: Option<char> = None;
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('~') {
+                current = line
+                    .trim_matches('~')
+                    .trim()
+                    .chars()
+                    .next()
+                    .map(|c| c.to_ascii_uppercase());
+                continue;
+            }
+            let Some(letter) = current else {
+                continue;
+            };
+            table.suffixes.entry(letter).or_default().insert(line.to_string());
+        }
+        Ok(table)
+    }
+
+    fn insert_trigram(&mut self, trigram: &str) -> Result<(), String> {
+        let trigram = trigram.trim();
+        let chars: Vec<char> = trigram.chars().collect();
+        if chars.len() != 3 {
+            return Err(format!("trigram entries must be exactly 3 chars, got {trigram:?}"));
+        }
+        let letter = chars[0].to_ascii_uppercase();
+        let suffix: String = chars[1..].iter().collect();
+        self.suffixes.entry(letter).or_default().insert(suffix);
+        Ok(())
+    }
+
+    fn contains(&self, first: char, suffix: &str) -> bool {
+        self.suffixes
+            .get(&first.to_ascii_uppercase())
+            .map(|set| set.contains(suffix))
+            .unwrap_or(false)
+    }
+}
+
+/// External trigram tables are cached by path (they're read-only on disk; the
+/// file could be huge and we must not re-parse it on every message).
+static EXTERNAL_TRIGRAMS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<TrigramTable>>>,
+> = std::sync::OnceLock::new();
+
+fn external_trigram_table(path: &str) -> Option<std::sync::Arc<TrigramTable>> {
+    let cache = EXTERNAL_TRIGRAMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache.lock().unwrap();
+    if let Some(t) = cache.get(path) {
+        return Some(t.clone());
+    }
+    match TrigramTable::load(path) {
+        Ok(t) => {
+            let t = std::sync::Arc::new(t);
+            cache.insert(path.to_string(), t.clone());
+            Some(t)
+        }
+        Err(e) => {
+            eprintln!("[score-messages] failed to load trigram table {path}: {e}");
+            None
+        }
+    }
+}
+
 /// Check B — Trigrams.
 ///
-/// +`score` per valid trigram (the first 3 chars of each word) found in the
-/// bugged trigram tables. The table is `~X~`-sectioned with 2-char suffixes;
-/// the bug `continue`s past later `~` headers (a `break` would fix it).
+/// +`score` per valid trigram (the first 3 chars of each word). Uses the
+/// embedded game table by default (with the NA/AU section-scan bug), or a
+/// user-supplied external table when `trigram_table_path` is set.
 fn check_b(input: &str, cfg: &Config) -> i64 {
     let mut padded = input.to_string();
     padded.push_str(&" ".repeat(cfg.max_chars.saturating_sub(padded.chars().count())));
     let all_trigrams = get_all_trigrams(&padded);
-    let lines = trigram_lines();
+
+    let external = if cfg.trigram_table_path.trim().is_empty() {
+        None
+    } else {
+        external_trigram_table(cfg.trigram_table_path.trim())
+    };
 
     let mut counter = 0;
     for trigram in &all_trigrams {
         if trigram.chars().count() < 3 {
             break;
         }
-        let first = trigram.chars().next().unwrap().to_ascii_uppercase();
-        let key = format!("~{first}~");
-        let Some(index) = lines.iter().position(|l| l.starts_with(&key)) else {
-            continue;
-        };
+        let first = trigram.chars().next().unwrap();
         let final_two: String = trigram.chars().skip(1).take(2).collect();
-        for line in &lines[index + 1..] {
-            // The bug: continue past later section headers instead of breaking.
-            if line.starts_with('~') {
-                continue;
+        let valid = match &external {
+            Some(table) => table.contains(first, &final_two),
+            None => {
+                // Embedded bugged table: `~X~`-sectioned; the bug scans past
+                // later `~` headers instead of stopping at the next section.
+                let key = format!("~{}~", first.to_ascii_uppercase());
+                let lines = trigram_lines();
+                let Some(index) = lines.iter().position(|l| l.starts_with(&key)) else {
+                    continue;
+                };
+                let mut matched = false;
+                for line in &lines[index + 1..] {
+                    // The bug: keep scanning past later section headers.
+                    if line.starts_with('~') {
+                        continue;
+                    }
+                    if line.contains(&final_two) {
+                        matched = true;
+                        break;
+                    }
+                }
+                matched
             }
-            if line.contains(&final_two) {
-                counter += 1;
-                break;
-            }
+        };
+        if valid {
+            counter += 1;
         }
     }
     counter * cfg.trigram.score
@@ -872,6 +1089,88 @@ mod tests {
         // A short word with an unlisted trigram scores 0 (or none valid).
         let (delta, _) = score_message("zz", &c);
         assert_eq!(delta, 0);
+    }
+
+    #[test]
+    fn external_trigram_table_loads_json_array() {
+        let table = TrigramTable::load_from_str(
+            r#"["the", "and", "hel"]"#,
+            "table.json",
+        )
+        .unwrap();
+        assert!(table.contains('t', "he"), "the -> t+he");
+        assert!(table.contains('a', "nd"), "and -> a+nd");
+        assert!(table.contains('h', "el"), "hel -> h+el");
+        assert!(!table.contains('z', "zz"), "unlisted");
+        // Case-insensitive first letter.
+        assert!(table.contains('T', "he"));
+    }
+
+    #[test]
+    fn external_trigram_table_loads_json_object() {
+        let table = TrigramTable::load_from_str(
+            r#"{"t": ["he", "hr"], "a": ["nd", "re"]}"#,
+            "table.json",
+        )
+        .unwrap();
+        assert!(table.contains('t', "he"));
+        assert!(table.contains('t', "hr"));
+        assert!(table.contains('a', "re"));
+        assert!(!table.contains('t', "nd"));
+    }
+
+    #[test]
+    fn external_trigram_table_loads_csv() {
+        // Rows of letter,suffix plus a full-trigram column, with a header row.
+        let table = TrigramTable::load_from_str(
+            "letter,suffix\nt,he\na,nd\nthr\n",
+            "table.csv",
+        )
+        .unwrap();
+        assert!(table.contains('t', "he"));
+        assert!(table.contains('a', "nd"));
+        assert!(table.contains('t', "hr"), "thr -> t+hr");
+        assert!(!table.contains('b', "ad"));
+    }
+
+    #[test]
+    fn external_trigram_table_loads_text_sections() {
+        let table = TrigramTable::load_from_str("~T~\nhe\nhr\n~A~\nnd\n", "table.txt")
+            .unwrap();
+        assert!(table.contains('t', "he"));
+        assert!(table.contains('a', "nd"));
+        assert!(!table.contains('t', "nd"), "strict per-letter matching");
+    }
+
+    #[test]
+    fn external_trigram_table_drives_check_b() {
+        // A tiny external table that recognises only "the" -> t+he.
+        let path = "/tmp/cockatiel_probe_trigram_test.csv";
+        std::fs::write(path, "letter,suffix\nt,he\n").unwrap();
+        let mut c = all_off();
+        c.trigram.toggle = true;
+        c.trigram_table_path = path.to_string();
+        // "the" word → trigram "the" → t+he → valid.
+        let (delta, notes) = score_message("the", &c);
+        assert_eq!(delta, 3, "external table should reward 'the'");
+        assert!(notes.contains(&"trigram".to_string()));
+        // A word not in the tiny table scores 0.
+        let (delta, _) = score_message("zzz", &c);
+        assert_eq!(delta, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bad_external_trigram_table_is_ignored_gracefully() {
+        let path = "/tmp/cockatiel_probe_trigram_missing.json";
+        let _ = std::fs::remove_file(path);
+        let mut c = all_off();
+        c.trigram.toggle = true;
+        c.trigram_table_path = path.to_string();
+        // A missing file means no external table: check_b falls back to the
+        // embedded (bugged) table, so a known word still scores.
+        let (delta, _) = score_message("hello", &c);
+        assert!(delta >= 3, "missing external table falls back to embedded");
     }
 
     #[test]

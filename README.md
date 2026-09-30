@@ -20,6 +20,26 @@ Plus an optional chat-specific **emoji** bonus (+1, toggleable), the
 time-based **frequency** anti-spam rule, and a **viewership multiplier** that
 scales the final delta by how small the current audience is.
 
+## External trigram table
+
+Check B normally uses the built-in game-accurate (bugged) trigram tables. To
+import your own, set `trigram_table_path` in `config.json` to a CSV, JSON, or
+text file (relative to the module's working directory). The file is read at
+startup and cached by path.
+
+Supported formats (chosen by file extension):
+
+- **`.json`** — an array of 3-char trigrams `["the", "and", "hel"]`, or an
+  object mapping a letter to its 2-char suffixes `{"t": ["he", "hr"]}`.
+- **`.csv`** — rows of `letter,suffix` pairs, or a single column of 3-char
+  trigrams. A `letter,suffix` / `trigram` header row is skipped.
+- **`.txt`** (or anything else) — the game's own `~X~`-sectioned format: a
+  `~T~` header followed by one 2-char suffix per line.
+
+External tables match strictly within their own letter's section (predictable
+for imported data), unlike the built-in table which replicates the game's
+section-scan bug. Leave `trigram_table_path` empty to keep the built-in table.
+
 ## Viewership multiplier
 
 When enabled, the module polls the engine's `channel_viewers` surface every

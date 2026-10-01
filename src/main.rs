@@ -332,6 +332,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 audio,
                                 audio_type,
                             } = pre;
+                            if !uuid.is_empty() {
+                                let receipt = ContainerForEngine {
+                                    version: 2,
+                                    auth_token: auth_token.clone(),
+                                    module_name: module_name.clone(),
+                                    module_instance_uuid7: instance_uuid.clone(),
+                                    payload: Some(EnginePayload::MessageAck(MessageAck {
+                                        message_uuid7: uuid.clone(),
+                                    })),
+                                };
+                                send_container(&write_shared, receipt).await;
+                            }
                             // ACK on EVERY path: the engine advances the
                             // pre-process stage only when every tracked
                             // recipient replies with the same message_uuid7.
@@ -442,6 +454,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                         }
                         Some(ModulePayload::MessageInProcess(process)) => {
+                            if !process.message_uuid7.is_empty() {
+                                let receipt = ContainerForEngine {
+                                    version: 2,
+                                    auth_token: auth_token.clone(),
+                                    module_name: module_name.clone(),
+                                    module_instance_uuid7: instance_uuid.clone(),
+                                    payload: Some(EnginePayload::MessageAck(MessageAck {
+                                        message_uuid7: process.message_uuid7.clone(),
+                                    })),
+                                };
+                                send_container(&write_shared, receipt).await;
+                            }
                             // Pass-through ack of the in-process stage so it
                             // never stalls (even though this module only
                             // declares pre-process capability).

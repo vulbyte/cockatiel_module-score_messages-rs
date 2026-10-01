@@ -8,7 +8,10 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tracing::{info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient, PromptKind};
+use cockatiel_client::proto::container_for_engine::Payload as EnginePayload;
+use cockatiel_client::proto::container_for_module::Payload as ModulePayload;
+use cockatiel_client::proto::*;
+use cockatiel_client::{CockatielClient, PromptKind};
 
 use score_messages_rs::{
     apply_flat_overlay, default_config, flat_map_for_write, score_message, viewership_multiplier,
@@ -56,12 +59,12 @@ async fn prompt_for_input(
         input_label: input_label.to_string(),
         prompt_type: prompt_type as i32,
     };
-    let container = Container {
-        version: 1,
+    let container = ContainerForEngine {
+        version: 2,
         auth_token: auth_token.to_string(),
         module_name: module_name.to_string(),
         module_instance_uuid7: instance_uuid.to_string(),
-        payload: Some(Payload::Prompt(prompt)),
+        payload: Some(EnginePayload::Prompt(prompt)),
     };
     let mut buf = Vec::new();
     if container.encode(&mut buf).is_err() {
@@ -188,7 +191,7 @@ async fn load_config(
 
 /// Encode and send a Container on the shared write half (used by the read loop
 /// and the config prompts alike).
-async fn send_container(write_shared: &Arc<AsyncMutex<WsWriteHalf>>, container: Container) {
+async fn send_container(write_shared: &Arc<AsyncMutex<WsWriteHalf>>, container: ContainerForEngine) {
     let mut buf = Vec::new();
     if container.encode(&mut buf).is_ok() {
         let mut w = write_shared.lock().await;
@@ -208,13 +211,13 @@ fn ack_preprocess_container(
     raw_message: Option<ChatMessage>,
     audio: Vec<u8>,
     audio_type: String,
-) -> Container {
-    Container {
-        version: 1,
+) -> ContainerForEngine {
+    ContainerForEngine {
+        version: 2,
         auth_token: auth_token.to_string(),
         module_name: module_name.to_string(),
         module_instance_uuid7: instance_uuid.to_string(),
-        payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+        payload: Some(EnginePayload::MessagePreProcess(MessagePreProcess {
             message_uuid7,
             raw_message,
             audio,
@@ -299,30 +302,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                     };
-                    let Ok(container) = Container::decode(data.as_ref()) else { continue };
+                    let Ok(container) = ContainerForModule::decode(data.as_ref()) else { continue };
 
                     match container.payload {
-                        Some(Payload::PromptResponse(resp)) => {
+                        Some(ModulePayload::PromptResponse(resp)) => {
                             // Forward operator answers to the awaiting prompt.
                             let _ = prompt_tx_task.send(resp);
                         }
-                        Some(Payload::AuthVerify(_)) => {
+                        Some(ModulePayload::AuthVerify(_)) => {
                             // Answer the engine's liveness probe with our auth token
                             // so a quiet period never severs us (this module does
                             // nothing during dead air, so it would otherwise be
                             // flagged unresponsive and killed on a schedule).
-                            let reply = Container {
-                                version: 1,
+                            let reply = ContainerForEngine {
+                                version: 2,
                                 auth_token: auth_token.clone(),
                                 module_name: module_name.clone(),
                                 module_instance_uuid7: instance_uuid.clone(),
-                                payload: Some(Payload::AuthVerify(AuthVerify {
+                                payload: Some(EnginePayload::AuthVerify(AuthVerify {
                                     cur_auth: auth_token.clone(),
                                 })),
                             };
                             send_container(&write_shared, reply).await;
                         }
-                        Some(Payload::MessagePreProcess(pre)) => {
+                        Some(ModulePayload::MessagePreProcess(pre)) => {
                             let MessagePreProcess {
                                 message_uuid7: uuid,
                                 raw_message,
@@ -405,12 +408,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // rating-counter inflation, no cooldown).
                                 let query_id = "userdb_adjust_score";
                                 let payload = rating_payload(&user_id, chat, delta, &notes);
-                                let query = Container {
-                                    version: 1,
+                                let query = ContainerForEngine {
+                                    version: 2,
                                     auth_token: auth_token.clone(),
                                     module_name: module_name.clone(),
                                     module_instance_uuid7: instance_uuid.clone(),
-                                    payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                                    payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
                                         query_id: query_id.to_string(),
                                         sql: payload.to_string(),
                                         params: vec![],
@@ -438,16 +441,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .await;
                         }
-                        Some(Payload::MessageInProcess(process)) => {
+                        Some(ModulePayload::MessageInProcess(process)) => {
                             // Pass-through ack of the in-process stage so it
                             // never stalls (even though this module only
                             // declares pre-process capability).
-                            let ack = Container {
-                                version: 1,
+                            let ack = ContainerForEngine {
+                                version: 2,
                                 auth_token: auth_token.clone(),
                                 module_name: module_name.clone(),
                                 module_instance_uuid7: instance_uuid.clone(),
-                                payload: Some(Payload::MessageInProcess(MessageInProcess {
+                                payload: Some(EnginePayload::MessageInProcess(MessageInProcess {
                                     message_uuid7: process.message_uuid7,
                                     raw_message: process.raw_message,
                                     processed_message: process.processed_message,
@@ -507,12 +510,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(conn) = CockatielClient::connect("config.json").await {
                     let (w, mut r) = conn.stream.split();
                         let write = Arc::new(AsyncMutex::new(w));
-                        let query = Container {
-                            version: 1,
+                        let query = ContainerForEngine {
+                            version: 2,
                             auth_token: conn.auth_token.clone(),
                             module_name: conn.config.module_name.clone(),
                             module_instance_uuid7: conn.instance_uuid7.clone(),
-                            payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                            payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
                                 query_id: "channel_viewers".to_string(),
                                 sql: "{}".to_string(),
                                 params: vec![],
@@ -532,21 +535,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 break;
                             };
                             let Ok(WsMessage::Binary(d)) = msg else { continue };
-                            let Ok(c) = Container::decode(d.as_ref()) else { continue };
+                            let Ok(c) = ContainerForModule::decode(d.as_ref()) else { continue };
                             match c.payload {
-                                Some(Payload::AuthVerify(_)) => {
-                                    let reply = Container {
-                                        version: 1,
+                                Some(ModulePayload::AuthVerify(_)) => {
+                                    let reply = ContainerForEngine {
+                                        version: 2,
                                         auth_token: conn.auth_token.clone(),
                                         module_name: conn.config.module_name.clone(),
                                         module_instance_uuid7: conn.instance_uuid7.clone(),
-                                        payload: Some(Payload::AuthVerify(AuthVerify {
+                                        payload: Some(EnginePayload::AuthVerify(AuthVerify {
                                             cur_auth: conn.auth_token.clone(),
                                         })),
                                     };
                                     send_container(&write, reply).await;
                                 }
-                                Some(Payload::DatabaseQueryResult(res)) => {
+                                Some(ModulePayload::DatabaseQueryResult(res)) => {
                                     // Peak viewer count across all channels.
                                     let mut peak = 0i64;
                                     if let Ok(json) =

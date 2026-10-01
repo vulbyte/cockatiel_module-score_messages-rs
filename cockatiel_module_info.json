@@ -25,6 +25,7 @@
   ],
   "capabilities": "preprocess",
   "command_flags": [
+    "run",
     "--release"
   ],
   "credentials": [
@@ -210,7 +211,7 @@
     }
   ],
   "description": "preprocess module that scores chat messages with the Animal Crossing (GCN) letter-scoring algorithm (checks: punctuation, trigrams, leading capital, repeating chars, space ratio, run-on sentences, 32-char groupings; plus an optional emoji bonus) and applies the delta to the user's score",
-  "launch_command": "cargo run",
+  "launch_command": "cargo",
   "min_rank": 0,
   "name": "score-messages",
   "price": 0,

@@ -230,7 +230,7 @@ fn ack_preprocess_container(
 /// the user DB row directly; anything else (platform handle) falls back to the
 /// platform+handle pair. The engine's `userdb_adjust_score` applies the REAL
 /// signed delta to `score` without touching the human-rating counters.
-fn rating_payload(user_id: &str, chat: &ChatMessage, delta: i64, notes: &[String]) -> serde_json::Value {
+fn rating_payload(user_id: &str, chat: &ChatMessage, delta: i32, notes: &[String]) -> serde_json::Value {
     let reason = format!("score-messages: {}", notes.join(","));
     let uuid7_shaped =
         user_id.chars().filter(|c| *c == '-').count() == 4 && user_id.len() == 36;
@@ -269,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Cached peak viewer count across platforms (fed by the viewer-poll task,
     // used to scale score deltas by the viewership multiplier).
-    let viewers_shared: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
+    let viewers_shared: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
 
     // Read task: forward PromptResponses to the awaiting prompt AND handle
     // message pre-processing. Spawned BEFORE load_config so prompts work.
@@ -378,7 +378,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     config
                                         .frequency
                                         .interval_secs
-                                        .max(config.frequency_interval_floor_secs),
+                                        .max(config.frequency_interval_floor_secs)
+                                        as u64,
                                 );
                                 if let Some(prev) = last_msg.get(&user_id) {
                                     if now.duration_since(*prev) < interval {
@@ -391,7 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // than the interval, then oldest-first if the
                                 // map still exceeds the size cap.
                                 last_msg.retain(|_, t| now.duration_since(*t) < interval);
-                                if last_msg.len() >= config.last_msg_cap {
+                                if last_msg.len() >= config.last_msg_cap as usize {
                                     if let Some(evict) = last_msg
                                         .iter()
                                         .min_by_key(|(_, t)| **t)
@@ -410,7 +411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if config.viewership_toggle {
                                     let viewers = *viewers_shared.lock().unwrap();
                                     let mult = viewership_multiplier(&config, viewers);
-                                    delta = ((delta as f64) * mult).round() as i64;
+                                    delta = ((delta as f32) * mult).round() as i32;
                                     if delta != 0 {
                                         notes.push(format!("viewership x{mult:.2}"));
                                     }
@@ -495,7 +496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let reconnect_cfg = config_shared.lock().unwrap().clone();
                 let mut backoff = reconnect_cfg.reconnect_base_secs;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
                     match CockatielClient::connect("config.json").await {
                         Ok(conn) => {
                             info!("Reconnected to engine");
@@ -528,7 +529,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             let mut poll = config_shared.lock().unwrap().viewership_poll_secs.max(1);
             loop {
-                tokio::time::sleep(Duration::from_secs(poll)).await;
+                tokio::time::sleep(Duration::from_secs(poll as u64)).await;
                 // Re-read the poll interval from the live config on each cycle.
                 poll = config_shared.lock().unwrap().viewership_poll_secs.max(1);
                 if let Ok(conn) = CockatielClient::connect("config.json").await {
@@ -548,7 +549,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         send_container(&write, query).await;
                         // Wait briefly for the answer, answering liveness probes.
                         let deadline = tokio::time::Instant::now()
-                            + Duration::from_secs((poll * 2).max(10));
+                            + Duration::from_secs((poll * 2).max(10) as u64);
                         while tokio::time::Instant::now() < deadline {
                             let Ok(Some(msg)) = tokio::time::timeout(
                                 Duration::from_secs(5),
@@ -575,7 +576,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 Some(ModulePayload::DatabaseQueryResult(res)) => {
                                     // Peak viewer count across all channels.
-                                    let mut peak = 0i64;
+                                    let mut peak = 0i32;
                                     if let Ok(json) =
                                         serde_json::from_slice::<serde_json::Value>(&res.result_blob)
                                     {
@@ -587,7 +588,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     .get("viewers")
                                                     .and_then(|v| v.as_i64())
                                                 {
-                                                    peak = peak.max(v);
+                                                    peak = peak.max(v as i32);
                                                 }
                                             }
                                         }

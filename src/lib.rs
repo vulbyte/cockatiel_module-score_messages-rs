@@ -3,25 +3,35 @@
 //! Scoring follows the Animal Crossing (GCN) letter-scoring algorithm (see
 //! https://hunter-r.com/ac-letter-scorer/ and
 //! https://github.com/HunterRDev/AC-Letter-Scorer), ported to chat messages.
-//! A message is scored through seven checks (A–G) whose points sum to the
+//! A message is scored through eight checks (A–H) whose points sum to the
 //! delta applied to the user's score:
 //!
-//!   A. Punctuation        — +20 if the text ends with `.`/`!`/`?` (and is
+//!   A. Punctuation        — +30 if the text ends with `.`/`!`/`?` (and is
 //!                           under the 192-char max); then for every
-//!                           punctuation mark, +10 if a capital letter appears
-//!                           within the next 3 chars, else −10.
-//!   B. Trigrams           — +3 per valid leading-3-chars-of-each-word
+//!                           punctuation mark, +20 if a capital letter appears
+//!                           within the next 3 chars, else 0.
+//!   B. Trigrams           — +8 per valid leading-3-chars-of-each-word
 //!                           trigram found in the game's (bugged) trigram
 //!                           tables.
-//!   C. Leading capital    — +20 if the first non-space char is a capital,
-//!                           else −10.
+//!   C. Leading capital    — +30 if the first non-space char is a capital,
+//!                           else 0.
 //!   D. Repeating chars    — −50 if any letter is repeated 3+ times
 //!                           sequentially (spaces ignored).
-//!   E. Space ratio        — +20 if spaces are ≥ 20% of non-space chars,
-//!                           else −20.
+//!   E. Space ratio        — +25 if spaces are ≥ 10% of non-space chars,
+//!                           else +5 (the penalty is a negative number, so a
+//!                           space-less short message is *rewarded* not
+//!                           punished — modern chat is built on "gg", "lol").
 //!   F. Run-on sentence    — −150 if a run of 75+ chars has no punctuation
 //!                           after a punctuation mark.
 //!   G. 32-char groupings  — −20 per 32-char group that contains no space.
+//!   H. Spam & gibberish   — −100 per signal: `spam_emoji_max`+ emoji, a
+//!                           symbol-ratio wall (morse), or a vowel-less
+//!                           long word. The counter to the positive bias.
+//!
+//! The weights are tuned to bias scoring toward positive: lowercase is never
+//! penalised, short space-less messages are rewarded, and the pure rewards
+//! (emoji, trigrams, punctuation, leading capital) are the main driver of a
+//! user's score — while exploitative spam is still punished harshly.
 //!
 //! Everything is a deterministic function of its inputs (a message + a
 //! config), with no network, no state and no side effects — which is exactly
@@ -38,18 +48,19 @@ use serde::{Deserialize, Serialize};
 const MAX_CHARS: usize = 192;
 
 /// The run-on check's no-punctuation threshold (chars).
-pub const RUN_ON_CHARS: usize = 75;
+pub const RUN_ON_CHARS: i32 = 75;
 
 /// The 32-char space-grouping window.
 pub const GROUPING_SIZE: usize = 32;
 
-/// The space-ratio threshold (spaces ÷ non-spaces, ×100).
-pub const SPACE_RATIO_PERCENT: i64 = 20;
+/// The space-ratio threshold (spaces ÷ non-spaces, ×100). Tuned to 10% so a
+/// message with any spaces earns the reward.
+pub const SPACE_RATIO_PERCENT: i32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub toggle: bool,
-    pub score: i64,
+    pub score: i32,
 }
 
 impl Default for Rule {
@@ -61,9 +72,9 @@ impl Default for Rule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrequencyRule {
     pub toggle: bool,
-    pub score: i64,
+    pub score: i32,
     #[serde(default = "default_interval")]
-    pub interval_secs: u64,
+    pub interval_secs: u32,
 }
 
 impl Default for FrequencyRule {
@@ -76,7 +87,7 @@ impl Default for FrequencyRule {
     }
 }
 
-fn default_interval() -> u64 {
+fn default_interval() -> u32 {
     2
 }
 
@@ -84,7 +95,7 @@ fn default_interval() -> u64 {
 pub struct Config {
     // ── The seven AC letter checks ──────────────────────────────────────
     /// Check A: punctuation.
-    #[serde(default)]
+    #[serde(default = "default_punctuation")]
     pub punctuation: Rule,
     /// Check B: valid trigrams.
     #[serde(default = "default_trigram")]
@@ -102,6 +113,13 @@ pub struct Config {
     /// Check E: space ratio.
     #[serde(default = "default_space_ratio")]
     pub space_ratio: Rule,
+    /// Check E: points applied when the space ratio is too low. This is a
+    /// *negative* number by default (−5), so a space-less short message is
+    /// actually rewarded (`-(-5)` = +5) rather than punished — modern chat is
+    /// built on "gg", "lol", "pog". The reward and this value are decoupled so
+    /// the generous reward on well-spaced text doesn't hammer short messages.
+    #[serde(default = "default_space_ratio_penalty")]
+    pub space_ratio_penalty: i32,
     /// Check F: run-on sentence.
     #[serde(default = "default_run_on")]
     pub run_on: Rule,
@@ -112,6 +130,23 @@ pub struct Config {
     /// Reward messages that include an emoji (engagement signal).
     #[serde(default = "default_emoji")]
     pub emoji: Rule,
+    /// Check H: punish spammy messages — too many emojis, symbol-heavy
+    /// (morse-like) text, or long vowel-less (gibberish) words.
+    #[serde(default = "default_spam")]
+    pub spam: Rule,
+    /// Check H: max emoji before the spam penalty fires.
+    #[serde(default = "default_spam_emoji_max")]
+    pub spam_emoji_max: i32,
+    /// Check H: % of non-space chars that are symbols (`.`, `-`, emoji, …)
+    /// which flags symbol/morse spam.
+    #[serde(default = "default_spam_symbol_ratio_pct")]
+    pub spam_symbol_ratio_pct: i32,
+    /// Check H: min word length to be checked for gibberish (vowel-less).
+    #[serde(default = "default_spam_gibberish_word_min")]
+    pub spam_gibberish_word_min: i32,
+    /// Check H: max vowel ratio (×100) below which a long word is gibberish.
+    #[serde(default = "default_spam_gibberish_vowel_pct")]
+    pub spam_gibberish_vowel_pct: i32,
     /// Punish posting again too soon after a user's last message.
     #[serde(default)]
     pub frequency: FrequencyRule,
@@ -125,21 +160,21 @@ pub struct Config {
     /// The reference viewer count where the multiplier is 1.0 (the streamer's
     /// "full house"). Fewer viewers → a higher multiplier.
     #[serde(default = "default_viewership_max_viewers")]
-    pub viewership_max_viewers: i64,
+    pub viewership_max_viewers: i32,
     /// The largest multiplier ever applied (clamp). 0 viewers (offline) also
     /// uses this ceiling.
     #[serde(default = "default_viewership_multiplier_max")]
-    pub viewership_multiplier_max: f64,
+    pub viewership_multiplier_max: f32,
     /// How often (seconds) the module re-queries the engine for viewer counts.
     #[serde(default = "default_viewership_poll_secs")]
-    pub viewership_poll_secs: u64,
+    pub viewership_poll_secs: u32,
     // ── Tunable scalars (defaults match the game's algorithm) ───────────
     #[serde(default = "default_run_on_chars")]
-    pub run_on_chars: usize,
+    pub run_on_chars: i32,
     #[serde(default = "default_grouping_size")]
     pub grouping_size: usize,
     #[serde(default = "default_space_ratio_pct")]
-    pub space_ratio_pct: i64,
+    pub space_ratio_pct: i32,
     /// Check A: the letter-body ceiling under which the ending-punctuation
     /// reward is granted (and the trigram padding length).
     #[serde(default = "default_max_chars")]
@@ -147,44 +182,47 @@ pub struct Config {
     /// Check A: points per punctuation mark that is followed (within 3 chars)
     /// by a capital letter.
     #[serde(default = "default_punct_capital_bonus")]
-    pub punct_capital_bonus: i64,
+    pub punct_capital_bonus: i32,
     /// Check A: points per punctuation mark NOT followed (within 3 chars) by a
     /// capital letter.
     #[serde(default = "default_punct_capital_penalty")]
-    pub punct_capital_penalty: i64,
+    pub punct_capital_penalty: i32,
     /// Check C: the penalty when the leading non-space char is not a capital.
     #[serde(default = "default_capital_penalty")]
-    pub capital_penalty: i64,
+    pub capital_penalty: i32,
     /// Check D: how many sequential repeats of a letter trigger the penalty.
     #[serde(default = "default_repeating_threshold")]
-    pub repeating_threshold: usize,
+    pub repeating_threshold: i32,
     /// Check F: the run-on scan only evaluates while more than this many chars
     /// remain in the message.
     #[serde(default = "default_run_on_window")]
-    pub run_on_window: usize,
+    pub run_on_window: i32,
     #[serde(default = "default_frequency_interval_floor_secs")]
-    pub frequency_interval_floor_secs: u64,
+    pub frequency_interval_floor_secs: u32,
     #[serde(default = "default_last_msg_cap")]
-    pub last_msg_cap: usize,
+    pub last_msg_cap: u32,
     #[serde(default = "default_prompt_timeout_secs")]
     pub prompt_timeout_secs: u32,
     #[serde(default = "default_reconnect_base_secs")]
-    pub reconnect_base_secs: u64,
+    pub reconnect_base_secs: u32,
     #[serde(default = "default_reconnect_max_secs")]
-    pub reconnect_max_secs: u64,
+    pub reconnect_max_secs: u32,
 }
 
+fn default_punctuation() -> Rule {
+    Rule { toggle: true, score: 30 }
+}
 fn default_trigram() -> Rule {
-    Rule { toggle: true, score: 3 }
+    Rule { toggle: true, score: 8 }
 }
 fn default_capital() -> Rule {
-    Rule { toggle: true, score: 20 }
+    Rule { toggle: true, score: 30 }
 }
 fn default_repeating() -> Rule {
     Rule { toggle: true, score: 50 }
 }
 fn default_space_ratio() -> Rule {
-    Rule { toggle: true, score: 20 }
+    Rule { toggle: true, score: 25 }
 }
 fn default_run_on() -> Rule {
     Rule { toggle: true, score: 150 }
@@ -193,20 +231,40 @@ fn default_grouping() -> Rule {
     Rule { toggle: true, score: 20 }
 }
 fn default_emoji() -> Rule {
-    Rule { toggle: true, score: 1 }
+    Rule { toggle: true, score: 15 }
+}
+fn default_spam() -> Rule {
+    Rule { toggle: true, score: 100 }
 }
 
-pub fn default_viewership_max_viewers() -> i64 {
+pub fn default_spam_emoji_max() -> i32 {
+    5
+}
+pub fn default_spam_symbol_ratio_pct() -> i32 {
+    30
+}
+pub fn default_spam_gibberish_word_min() -> i32 {
+    8
+}
+pub fn default_spam_gibberish_vowel_pct() -> i32 {
+    25
+}
+
+pub fn default_space_ratio_penalty() -> i32 {
+    -5
+}
+
+pub fn default_viewership_max_viewers() -> i32 {
     1000
 }
-pub fn default_viewership_multiplier_max() -> f64 {
+pub fn default_viewership_multiplier_max() -> f32 {
     5.0
 }
-pub fn default_viewership_poll_secs() -> u64 {
+pub fn default_viewership_poll_secs() -> u32 {
     30
 }
 
-pub fn default_run_on_chars() -> usize {
+pub fn default_run_on_chars() -> i32 {
     RUN_ON_CHARS
 }
 pub fn default_grouping_size() -> usize {
@@ -215,51 +273,57 @@ pub fn default_grouping_size() -> usize {
 pub fn default_max_chars() -> usize {
     MAX_CHARS
 }
-pub fn default_punct_capital_bonus() -> i64 {
-    10
+pub fn default_punct_capital_bonus() -> i32 {
+    20
 }
-pub fn default_punct_capital_penalty() -> i64 {
-    10
+pub fn default_punct_capital_penalty() -> i32 {
+    0
 }
-pub fn default_capital_penalty() -> i64 {
-    10
+pub fn default_capital_penalty() -> i32 {
+    0
 }
-pub fn default_repeating_threshold() -> usize {
+pub fn default_repeating_threshold() -> i32 {
     3
 }
-pub fn default_run_on_window() -> usize {
+pub fn default_run_on_window() -> i32 {
     76
 }
-pub fn default_space_ratio_pct() -> i64 {
+pub fn default_space_ratio_pct() -> i32 {
     SPACE_RATIO_PERCENT
 }
-pub fn default_frequency_interval_floor_secs() -> u64 {
+pub fn default_frequency_interval_floor_secs() -> u32 {
     1
 }
-pub fn default_last_msg_cap() -> usize {
+pub fn default_last_msg_cap() -> u32 {
     10_000
 }
 pub fn default_prompt_timeout_secs() -> u32 {
     60
 }
-pub fn default_reconnect_base_secs() -> u64 {
+pub fn default_reconnect_base_secs() -> u32 {
     1
 }
-pub fn default_reconnect_max_secs() -> u64 {
+pub fn default_reconnect_max_secs() -> u32 {
     30
 }
 
 pub fn default_config() -> Config {
     Config {
-        punctuation: Rule { toggle: true, score: 20 },
+        punctuation: Rule { toggle: true, score: 30 },
         trigram: default_trigram(),
         trigram_table_path: String::new(),
         capital: default_capital(),
         repeating: default_repeating(),
         space_ratio: default_space_ratio(),
+        space_ratio_penalty: default_space_ratio_penalty(),
         run_on: default_run_on(),
         grouping: default_grouping(),
         emoji: default_emoji(),
+        spam: default_spam(),
+        spam_emoji_max: default_spam_emoji_max(),
+        spam_symbol_ratio_pct: default_spam_symbol_ratio_pct(),
+        spam_gibberish_word_min: default_spam_gibberish_word_min(),
+        spam_gibberish_vowel_pct: default_spam_gibberish_vowel_pct(),
         frequency: FrequencyRule::default(),
         viewership_toggle: false,
         viewership_max_viewers: default_viewership_max_viewers(),
@@ -361,7 +425,7 @@ pub fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_js
                 cfg.$field.toggle = t;
             }
             if let Some(s) = parse_score(ms.get(concat!($prefix, "_score"))) {
-                cfg.$field.score = s;
+                cfg.$field.score = s as i32;
             }
         };
     }
@@ -373,66 +437,82 @@ pub fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_js
     apply_rule!(capital, "capital");
     apply_rule!(repeating, "repeating");
     apply_rule!(space_ratio, "space_ratio");
+    if let Some(v) = parse_i64(ms.get("space_ratio_penalty")) {
+        cfg.space_ratio_penalty = v as i32;
+    }
     apply_rule!(run_on, "run_on");
     apply_rule!(grouping, "grouping");
     apply_rule!(emoji, "emoji");
+    apply_rule!(spam, "spam");
+    if let Some(v) = parse_usize(ms.get("spam_emoji_max")) {
+        cfg.spam_emoji_max = v as i32;
+    }
+    if let Some(v) = parse_i64(ms.get("spam_symbol_ratio_pct")) {
+        cfg.spam_symbol_ratio_pct = v as i32;
+    }
+    if let Some(v) = parse_usize(ms.get("spam_gibberish_word_min")) {
+        cfg.spam_gibberish_word_min = v as i32;
+    }
+    if let Some(v) = parse_i64(ms.get("spam_gibberish_vowel_pct")) {
+        cfg.spam_gibberish_vowel_pct = v as i32;
+    }
     apply_rule!(frequency, "frequency");
     if let Some(t) = parse_toggle(ms.get("viewership_toggle")) {
         cfg.viewership_toggle = t;
     }
     if let Some(v) = parse_score(ms.get("viewership_max_viewers")) {
-        cfg.viewership_max_viewers = v;
+        cfg.viewership_max_viewers = v as i32;
     }
     if let Some(v) = parse_f64(ms.get("viewership_multiplier_max")) {
-        cfg.viewership_multiplier_max = v;
+        cfg.viewership_multiplier_max = v as f32;
     }
     if let Some(v) = parse_u64(ms.get("viewership_poll_secs")) {
-        cfg.viewership_poll_secs = v;
+        cfg.viewership_poll_secs = v as u32;
     }
     if let Some(i) = parse_u64(ms.get("frequency_interval_secs")) {
-        cfg.frequency.interval_secs = i;
+        cfg.frequency.interval_secs = i as u32;
     }
     if let Some(v) = parse_usize(ms.get("run_on_chars")) {
-        cfg.run_on_chars = v;
+        cfg.run_on_chars = v as i32;
     }
     if let Some(v) = parse_usize(ms.get("grouping_size")) {
         cfg.grouping_size = v;
     }
     if let Some(v) = parse_i64(ms.get("space_ratio_pct")) {
-        cfg.space_ratio_pct = v;
+        cfg.space_ratio_pct = v as i32;
     }
     if let Some(v) = parse_usize(ms.get("max_chars")) {
         cfg.max_chars = v;
     }
     if let Some(v) = parse_i64(ms.get("punct_capital_bonus")) {
-        cfg.punct_capital_bonus = v;
+        cfg.punct_capital_bonus = v as i32;
     }
     if let Some(v) = parse_i64(ms.get("punct_capital_penalty")) {
-        cfg.punct_capital_penalty = v;
+        cfg.punct_capital_penalty = v as i32;
     }
     if let Some(v) = parse_i64(ms.get("capital_penalty")) {
-        cfg.capital_penalty = v;
+        cfg.capital_penalty = v as i32;
     }
     if let Some(v) = parse_usize(ms.get("repeating_threshold")) {
-        cfg.repeating_threshold = v;
+        cfg.repeating_threshold = v as i32;
     }
     if let Some(v) = parse_usize(ms.get("run_on_window")) {
-        cfg.run_on_window = v;
+        cfg.run_on_window = v as i32;
     }
     if let Some(v) = parse_u64(ms.get("frequency_interval_floor_secs")) {
-        cfg.frequency_interval_floor_secs = v;
+        cfg.frequency_interval_floor_secs = v as u32;
     }
     if let Some(v) = parse_usize(ms.get("last_msg_cap")) {
-        cfg.last_msg_cap = v;
+        cfg.last_msg_cap = v as u32;
     }
     if let Some(v) = parse_u32(ms.get("prompt_timeout_secs")) {
         cfg.prompt_timeout_secs = v;
     }
     if let Some(v) = parse_u64(ms.get("reconnect_base_secs")) {
-        cfg.reconnect_base_secs = v;
+        cfg.reconnect_base_secs = v as u32;
     }
     if let Some(v) = parse_u64(ms.get("reconnect_max_secs")) {
-        cfg.reconnect_max_secs = v;
+        cfg.reconnect_max_secs = v as u32;
     }
     cfg
 }
@@ -454,7 +534,7 @@ pub fn flat_map_for_write(
             let toggle_key = concat!($prefix, "_toggle");
             let score_key = concat!($prefix, "_score");
             let toggle = parse_toggle(ms.get(toggle_key)).unwrap_or(cfg.$field.toggle);
-            let score = parse_score(ms.get(score_key)).unwrap_or(cfg.$field.score);
+            let score = parse_score(ms.get(score_key)).map(|s| s as i32).unwrap_or(cfg.$field.score);
             out.insert(toggle_key.to_string(), serde_json::Value::Bool(toggle));
             out.insert(score_key.to_string(), serde_json::json!(score));
         };
@@ -470,9 +550,40 @@ pub fn flat_map_for_write(
     put_rule!(capital, "capital");
     put_rule!(repeating, "repeating");
     put_rule!(space_ratio, "space_ratio");
+    out.insert(
+        "space_ratio_penalty".to_string(),
+        serde_json::json!(
+            parse_score(ms.get("space_ratio_penalty")).map(|s| s as i32).unwrap_or(cfg.space_ratio_penalty)
+        ),
+    );
     put_rule!(run_on, "run_on");
     put_rule!(grouping, "grouping");
     put_rule!(emoji, "emoji");
+    put_rule!(spam, "spam");
+    out.insert(
+        "spam_emoji_max".to_string(),
+        serde_json::json!(
+            parse_score(ms.get("spam_emoji_max")).unwrap_or(cfg.spam_emoji_max as i64)
+        ),
+    );
+    out.insert(
+        "spam_symbol_ratio_pct".to_string(),
+        serde_json::json!(
+            parse_score(ms.get("spam_symbol_ratio_pct")).map(|s| s as i32).unwrap_or(cfg.spam_symbol_ratio_pct)
+        ),
+    );
+    out.insert(
+        "spam_gibberish_word_min".to_string(),
+        serde_json::json!(
+            parse_score(ms.get("spam_gibberish_word_min")).unwrap_or(cfg.spam_gibberish_word_min as i64)
+        ),
+    );
+    out.insert(
+        "spam_gibberish_vowel_pct".to_string(),
+        serde_json::json!(
+            parse_score(ms.get("spam_gibberish_vowel_pct")).map(|s| s as i32).unwrap_or(cfg.spam_gibberish_vowel_pct)
+        ),
+    );
     put_rule!(frequency, "frequency");
     out.insert(
         "viewership_toggle".to_string(),
@@ -483,22 +594,22 @@ pub fn flat_map_for_write(
     out.insert(
         "viewership_max_viewers".to_string(),
         serde_json::json!(
-            parse_score(ms.get("viewership_max_viewers")).unwrap_or(cfg.viewership_max_viewers)
+            parse_score(ms.get("viewership_max_viewers")).map(|s| s as i32).unwrap_or(cfg.viewership_max_viewers)
         ),
     );
     out.insert(
         "viewership_multiplier_max".to_string(),
         serde_json::json!(
-            parse_f64(ms.get("viewership_multiplier_max")).unwrap_or(cfg.viewership_multiplier_max)
+            parse_f64(ms.get("viewership_multiplier_max")).map(|v| v as f32).unwrap_or(cfg.viewership_multiplier_max)
         ),
     );
     out.insert(
         "viewership_poll_secs".to_string(),
         serde_json::json!(
-            parse_u64(ms.get("viewership_poll_secs")).unwrap_or(cfg.viewership_poll_secs)
+            parse_u64(ms.get("viewership_poll_secs")).map(|v| v as u32).unwrap_or(cfg.viewership_poll_secs)
         ),
     );
-    let interval = parse_u64(ms.get("frequency_interval_secs")).unwrap_or(cfg.frequency.interval_secs);
+    let interval = parse_u64(ms.get("frequency_interval_secs")).map(|v| v as u32).unwrap_or(cfg.frequency.interval_secs);
     out.insert("frequency_interval_secs".to_string(), serde_json::json!(interval));
     macro_rules! put_scalar {
         ($key:literal, $parse:ident, $cfg_val:expr) => {{
@@ -506,24 +617,24 @@ pub fn flat_map_for_write(
             out.insert($key.to_string(), serde_json::json!(v));
         }};
     }
-    put_scalar!("run_on_chars", parse_usize, cfg.run_on_chars);
+    put_scalar!("run_on_chars", parse_usize, cfg.run_on_chars as usize);
     put_scalar!("grouping_size", parse_usize, cfg.grouping_size);
-    put_scalar!("space_ratio_pct", parse_i64, cfg.space_ratio_pct);
+    put_scalar!("space_ratio_pct", parse_i64, cfg.space_ratio_pct as i64);
     put_scalar!("max_chars", parse_usize, cfg.max_chars);
-    put_scalar!("punct_capital_bonus", parse_i64, cfg.punct_capital_bonus);
-    put_scalar!("punct_capital_penalty", parse_i64, cfg.punct_capital_penalty);
-    put_scalar!("capital_penalty", parse_i64, cfg.capital_penalty);
-    put_scalar!("repeating_threshold", parse_usize, cfg.repeating_threshold);
-    put_scalar!("run_on_window", parse_usize, cfg.run_on_window);
+    put_scalar!("punct_capital_bonus", parse_i64, cfg.punct_capital_bonus as i64);
+    put_scalar!("punct_capital_penalty", parse_i64, cfg.punct_capital_penalty as i64);
+    put_scalar!("capital_penalty", parse_i64, cfg.capital_penalty as i64);
+    put_scalar!("repeating_threshold", parse_usize, cfg.repeating_threshold as usize);
+    put_scalar!("run_on_window", parse_usize, cfg.run_on_window as usize);
     put_scalar!(
         "frequency_interval_floor_secs",
         parse_u64,
-        cfg.frequency_interval_floor_secs
+        cfg.frequency_interval_floor_secs as u64
     );
-    put_scalar!("last_msg_cap", parse_usize, cfg.last_msg_cap);
+    put_scalar!("last_msg_cap", parse_usize, cfg.last_msg_cap as usize);
     put_scalar!("prompt_timeout_secs", parse_u32, cfg.prompt_timeout_secs);
-    put_scalar!("reconnect_base_secs", parse_u64, cfg.reconnect_base_secs);
-    put_scalar!("reconnect_max_secs", parse_u64, cfg.reconnect_max_secs);
+    put_scalar!("reconnect_base_secs", parse_u64, cfg.reconnect_base_secs as u64);
+    put_scalar!("reconnect_max_secs", parse_u64, cfg.reconnect_max_secs as u64);
     out
 }
 
@@ -561,11 +672,17 @@ pub fn is_emoji(c: char) -> bool {
 /// 192-char max. Then scan every punctuation mark: if a capital letter appears
 /// within the next 3 characters, +10; otherwise −10. Scan position advances
 /// past the found capital (or 4 chars) so each occurrence is scored once.
-fn check_a(input: &str, cfg: &Config) -> i64 {
+fn check_a(input: &str, cfg: &Config) -> i32 {
     let trimmed: String = input.trim_matches([' ', '\t']).to_string();
     let mut score = 0;
 
-    if trimmed.chars().count() < cfg.max_chars && matches!(trimmed.chars().last(), Some('.') | Some('!') | Some('?')) {
+    // The ending-punctuation reward is for real sentences: only grant it when
+    // the message actually contains letters/digits. A symbol-only wall (morse
+    // code, ".........") ends in a `.` but is not a sentence.
+    if trimmed.chars().count() < cfg.max_chars
+        && matches!(trimmed.chars().last(), Some('.') | Some('!') | Some('?'))
+        && input.chars().any(|c| c.is_alphanumeric())
+    {
         score += cfg.punctuation.score;
     }
 
@@ -823,7 +940,7 @@ fn external_trigram_table(path: &str) -> Option<std::sync::Arc<TrigramTable>> {
 /// +`score` per valid trigram (the first 3 chars of each word). Uses the
 /// embedded game table by default (with the NA/AU section-scan bug), or a
 /// user-supplied external table when `trigram_table_path` is set.
-fn check_b(input: &str, cfg: &Config) -> i64 {
+fn check_b(input: &str, cfg: &Config) -> i32 {
     let mut padded = input.to_string();
     padded.push_str(&" ".repeat(cfg.max_chars.saturating_sub(padded.chars().count())));
     let all_trigrams = get_all_trigrams(&padded);
@@ -873,7 +990,7 @@ fn check_b(input: &str, cfg: &Config) -> i64 {
 }
 
 /// Check C — Leading capital.
-fn check_c(input: &str, cfg: &Config) -> i64 {
+fn check_c(input: &str, cfg: &Config) -> i32 {
     match input.chars().find(|c| !c.is_whitespace()) {
         Some(c) if c.is_ascii_uppercase() => cfg.capital.score,
         Some(_) => -cfg.capital_penalty,
@@ -883,7 +1000,7 @@ fn check_c(input: &str, cfg: &Config) -> i64 {
 
 /// Check D — Repeating characters. −50 if any letter repeats 3+ times
 /// sequentially (spaces removed first, per the game).
-fn check_d(input: &str, cfg: &Config) -> i64 {
+fn check_d(input: &str, cfg: &Config) -> i32 {
     let trimmed: String = input.trim_matches([' ', '\t']).chars().filter(|c| *c != ' ').collect();
     let chars: Vec<char> = trimmed.chars().collect();
     let mut run = 0u32;
@@ -907,28 +1024,31 @@ fn check_d(input: &str, cfg: &Config) -> i64 {
     0
 }
 
-/// Check E — Space ratio. +20 if spaces are ≥ 20% of non-space chars, else −20.
-fn check_e(input: &str, cfg: &Config) -> i64 {
-    let num_spaces = input.chars().filter(|c| *c == ' ').count() as i64;
-    let total = input.chars().count() as i64;
+/// Check E — Space ratio. +`space_ratio` if spaces are ≥ `space_ratio_pct`% of
+/// non-space chars, else −`space_ratio_penalty`. `space_ratio_penalty` is
+/// negative by default, so the else-branch is a small *reward* (`-(-5)` = +5):
+/// short space-less messages like "gg" are encouraged, not punished.
+fn check_e(input: &str, cfg: &Config) -> i32 {
+    let num_spaces = input.chars().filter(|c| *c == ' ').count() as i32;
+    let total = input.chars().count() as i32;
     let num_non = total - num_spaces;
     if num_non > 0 && (num_spaces * 100) / num_non >= cfg.space_ratio_pct {
         cfg.space_ratio.score
     } else {
-        -cfg.space_ratio.score
+        -cfg.space_ratio_penalty
     }
 }
 
 /// Check F — Run-on sentence. −150 if, after a punctuation mark, a run of
 /// `run_on_chars`+ sequential chars has no punctuation.
-fn check_f(input: &str, cfg: &Config) -> i64 {
+fn check_f(input: &str, cfg: &Config) -> i32 {
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
     let mut i = 0;
     // The game only evaluates while more than `run_on_window` chars remain.
-    while len.saturating_sub(i) > cfg.run_on_window {
+    while len.saturating_sub(i) > cfg.run_on_window as usize {
         if matches!(chars[i], '.' | '?' | '!') {
-            let mut sentence_len = 0usize;
+            let mut sentence_len = 0i32;
             i += 1;
             while i < len && !matches!(chars[i], '.' | '?' | '!') {
                 sentence_len += 1;
@@ -947,7 +1067,7 @@ fn check_f(input: &str, cfg: &Config) -> i64 {
 }
 
 /// Check G — 32-char space groupings. −20 per 32-char group with no space.
-fn check_g(input: &str, cfg: &Config) -> i64 {
+fn check_g(input: &str, cfg: &Config) -> i32 {
     let trimmed: Vec<char> = input.trim_matches([' ', '\t']).chars().collect();
     let total = trimmed.len();
     let size = cfg.grouping_size.max(1);
@@ -962,11 +1082,68 @@ fn check_g(input: &str, cfg: &Config) -> i64 {
     score
 }
 
-/// Score a message with the seven AC checks (plus the emoji extra) and return
-/// the total delta plus the rules that fired. Positive = reward, negative =
-/// punishment.
-pub fn score_message(message: &str, cfg: &Config) -> (i64, Vec<String>) {
-    let mut delta = 0i64;
+/// Check H — Spam & gibberish (chat-specific anti-exploit rule).
+///
+/// Punishes messages that look like exploitation rather than chat:
+///   - **Emoji spam**: more than `spam_emoji_max` emoji in one message.
+///   - **Symbol/morse spam**: `spam_symbol_ratio_pct`%+ of the non-space chars
+///     are symbols (`.`, `-`, `#`, `|`, …) — the classic morse-code wall
+///     (`.... . .-.. .-.. ---`) and symbol-spam patterns.
+///   - **Gibberish**: a word of `spam_gibberish_word_min`+ letters whose vowel
+///     share is below `spam_gibberish_vowel_pct`% (keyboard mash like
+///     "shgekskshsjs").
+///
+/// Each detected signal contributes `spam.score` to the penalty, so a message
+/// that stacks signals is punished proportionally harder. This is the counter
+/// to the positive bias: normal chat is rewarded, exploitation is not.
+fn check_h(input: &str, cfg: &Config) -> i32 {
+    let mut penalty = 0i32;
+
+    let emoji_count = input.chars().filter(|c| is_emoji(*c)).count() as i32;
+    if emoji_count > cfg.spam_emoji_max {
+        penalty += cfg.spam.score;
+    }
+
+    let non_space: Vec<char> = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if !non_space.is_empty() {
+        let symbols = non_space
+            .iter()
+            .filter(|c| !c.is_alphanumeric() && !is_emoji(**c))
+            .count();
+        let pct = (symbols as i32 * 100) / non_space.len() as i32;
+        if pct >= cfg.spam_symbol_ratio_pct {
+            penalty += cfg.spam.score;
+        }
+    }
+
+    // Gibberish words: split on non-letters, check vowel share per word.
+    let mut word = String::new();
+    for c in input.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_alphabetic() {
+            word.push(c);
+        } else if !word.is_empty() {
+            if word.chars().count() as i32 >= cfg.spam_gibberish_word_min {
+                let vowels = word
+                    .chars()
+                    .filter(|c| matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u' | 'y'))
+                    .count();
+                let vowel_pct = (vowels as i32 * 100) / word.chars().count() as i32;
+                if vowel_pct < cfg.spam_gibberish_vowel_pct {
+                    penalty += cfg.spam.score;
+                }
+            }
+            word.clear();
+        }
+    }
+
+    -penalty
+}
+
+/// Score a message with the seven AC checks (plus the emoji and spam extras)
+/// and return the total delta plus the rules that fired. Positive = reward,
+/// negative = punishment.
+pub fn score_message(message: &str, cfg: &Config) -> (i32, Vec<String>) {
+    let mut delta = 0i32;
     let mut notes = Vec::new();
 
     if cfg.punctuation.toggle {
@@ -1022,6 +1199,13 @@ pub fn score_message(message: &str, cfg: &Config) -> (i64, Vec<String>) {
         delta += cfg.emoji.score;
         notes.push("emoji".into());
     }
+    if cfg.spam.toggle {
+        let d = check_h(message, cfg);
+        if d != 0 {
+            delta += d;
+            notes.push("spam".into());
+        }
+    }
 
     (delta, notes)
 }
@@ -1031,13 +1215,13 @@ pub fn score_message(message: &str, cfg: &Config) -> (i64, Vec<String>) {
 /// multiplier, so interaction on a small stream is rewarded more and a large
 /// stream gets more breathing room. `viewers == 0` (channel offline) uses the
 /// ceiling. Returns `1.0` when the viewership modifier is disabled.
-pub fn viewership_multiplier(cfg: &Config, viewers: i64) -> f64 {
+pub fn viewership_multiplier(cfg: &Config, viewers: i32) -> f32 {
     if !cfg.viewership_toggle {
         return 1.0;
     }
     let max_viewers = cfg.viewership_max_viewers.max(1);
     let viewers = viewers.max(1); // 0/offline treated as the smallest audience
-    let raw = max_viewers as f64 / viewers as f64;
+    let raw = max_viewers as f32 / viewers as f32;
     raw.clamp(1.0, cfg.viewership_multiplier_max.max(1.0))
 }
 
@@ -1056,6 +1240,7 @@ mod tests {
             &mut c.run_on,
             &mut c.grouping,
             &mut c.emoji,
+            &mut c.spam,
         ] {
             r.toggle = false;
         }
@@ -1066,13 +1251,13 @@ mod tests {
     fn check_a_rewards_ending_punctuation_and_capitals_after() {
         let mut c = all_off();
         c.punctuation.toggle = true;
-        // Ends with "!" and no capital after (nothing after): +20 only.
+        // Ends with "!" and no capital after (nothing after): +30 only.
         let (delta, notes) = score_message("Hello there!", &c);
-        assert_eq!(delta, 20);
+        assert_eq!(delta, 30);
         assert!(notes.contains(&"punctuation".to_string()));
         // Ends with "." and a capital within the next 3 chars after the "."
         let (delta, _) = score_message("Hello there. Welcome back.", &c);
-        assert!(delta >= 20, "expected punctuation reward, got {delta}");
+        assert!(delta >= 30, "expected punctuation reward, got {delta}");
         // No punctuation: 0.
         let (delta, _) = score_message("hello there", &c);
         assert_eq!(delta, 0);
@@ -1150,9 +1335,9 @@ mod tests {
         let mut c = all_off();
         c.trigram.toggle = true;
         c.trigram_table_path = path.to_string();
-        // "the" word → trigram "the" → t+he → valid.
+        // "the" word → trigram "the" → t+he → valid (trigram score 8).
         let (delta, notes) = score_message("the", &c);
-        assert_eq!(delta, 3, "external table should reward 'the'");
+        assert_eq!(delta, 8, "external table should reward 'the'");
         assert!(notes.contains(&"trigram".to_string()));
         // A word not in the tiny table scores 0.
         let (delta, _) = score_message("zzz", &c);
@@ -1178,10 +1363,11 @@ mod tests {
         let mut c = all_off();
         c.capital.toggle = true;
         let (delta, notes) = score_message("Hello", &c);
-        assert_eq!(delta, 20);
+        assert_eq!(delta, 30);
         assert!(notes.contains(&"capital".to_string()));
+        // Lowercase is never penalised (capital_penalty is 0).
         let (delta, _) = score_message("hello", &c);
-        assert_eq!(delta, -10);
+        assert_eq!(delta, 0);
     }
 
     #[test]
@@ -1199,12 +1385,13 @@ mod tests {
     fn check_e_rewards_good_space_ratio() {
         let mut c = all_off();
         c.space_ratio.toggle = true;
-        // 5 spaces / 20 non-space = 25% >= 20% → +20.
+        // 6 spaces / 7 non-space = 85% >= 10% → +25.
         let (delta, _) = score_message("a b c d e f g", &c);
-        assert_eq!(delta, 20);
-        // 0 spaces → −20.
+        assert_eq!(delta, 25);
+        // 0 spaces → −space_ratio_penalty = −(−5) = +5. Short messages like
+        // "gg" are rewarded, not punished.
         let (delta, _) = score_message("aaaaaaaaaaaa", &c);
-        assert_eq!(delta, -20);
+        assert_eq!(delta, 5);
     }
 
     #[test]
@@ -1246,7 +1433,7 @@ mod tests {
         let mut c = all_off();
         c.emoji.toggle = true;
         let (delta, notes) = score_message("nice stream 👍", &c);
-        assert_eq!(delta, 1);
+        assert_eq!(delta, 15);
         assert!(notes.contains(&"emoji".to_string()));
     }
 
@@ -1257,11 +1444,12 @@ mod tests {
         let written = flat_map_for_write(&cfg, &root, &serde_json::Map::new());
         assert_eq!(written["run_on_chars"], 75);
         assert_eq!(written["grouping_size"], 32);
-        assert_eq!(written["space_ratio_pct"], 20);
+        assert_eq!(written["space_ratio_pct"], 10);
         assert_eq!(written["max_chars"], 192);
-        assert_eq!(written["punct_capital_bonus"], 10);
-        assert_eq!(written["punct_capital_penalty"], 10);
-        assert_eq!(written["capital_penalty"], 10);
+        assert_eq!(written["punct_capital_bonus"], 20);
+        assert_eq!(written["punct_capital_penalty"], 0);
+        assert_eq!(written["capital_penalty"], 0);
+        assert_eq!(written["space_ratio_penalty"], -5);
         assert_eq!(written["repeating_threshold"], 3);
         assert_eq!(written["run_on_window"], 76);
         assert_eq!(written["prompt_timeout_secs"], 60);
@@ -1272,10 +1460,11 @@ mod tests {
         let restored = apply_flat_overlay(default_config(), &written);
         assert_eq!(restored.run_on_chars, 75);
         assert_eq!(restored.grouping_size, 32);
-        assert_eq!(restored.space_ratio_pct, 20);
+        assert_eq!(restored.space_ratio_pct, 10);
         assert_eq!(restored.max_chars, 192);
-        assert_eq!(restored.punct_capital_bonus, 10);
-        assert_eq!(restored.capital_penalty, 10);
+        assert_eq!(restored.punct_capital_bonus, 20);
+        assert_eq!(restored.capital_penalty, 0);
+        assert_eq!(restored.space_ratio_penalty, -5);
         assert_eq!(restored.repeating_threshold, 3);
         assert_eq!(restored.run_on_window, 76);
         assert!(!restored.viewership_toggle);
@@ -1304,11 +1493,11 @@ mod tests {
     #[test]
     fn tunables_drive_scoring() {
         let mut c = all_off();
-        // Lower the space-ratio bar: 1 space in 20 chars (5%) now earns +20.
+        // Lower the space-ratio bar: 1 space in 20 chars (5%) now earns +25.
         c.space_ratio.toggle = true;
         c.space_ratio_pct = 5;
         let (delta, notes) = score_message("a bbbbbbbbbbbbbbbbbbb", &c);
-        assert_eq!(delta, 20);
+        assert_eq!(delta, 25);
         assert!(notes.contains(&"space_ratio".to_string()));
         // Raise the grouping window to 8 so "hello world" (11 chars) hits a group.
         let mut g = all_off();
@@ -1371,5 +1560,72 @@ mod tests {
         assert_eq!(viewership_multiplier(&cfg, 1), 3.0);
         // Negative viewers (defensive) behave like offline → ceiling.
         assert_eq!(viewership_multiplier(&cfg, -5), 3.0);
+    }
+
+    #[test]
+    fn check_h_punishes_emoji_spam() {
+        let mut c = all_off();
+        c.spam.toggle = true;
+        // 6 emoji > spam_emoji_max (5) → −100 (symbol wall excludes emoji, so
+        // only the emoji-spam signal fires).
+        let (delta, notes) = score_message("🔥🔥🔥🔥🔥🔥", &c);
+        assert_eq!(delta, -100);
+        assert!(notes.contains(&"spam".to_string()));
+        // A couple of emoji in real chat is fine (not > max, low symbol share).
+        let (delta, _) = score_message("gg wp 👍👏", &c);
+        assert_eq!(delta, 0);
+    }
+
+    #[test]
+    fn check_h_punishes_morse_symbol_walls() {
+        let mut c = all_off();
+        c.spam.toggle = true;
+        // Morse: 100% of non-space chars are symbols → −100.
+        let (delta, notes) = score_message(".... . .-.. .-.. ---", &c);
+        assert_eq!(delta, -100);
+        assert!(notes.contains(&"spam".to_string()));
+        // Normal punctuation is below the 30% symbol threshold.
+        let (delta, _) = score_message("hello world!", &c);
+        assert_eq!(delta, 0);
+    }
+
+    #[test]
+    fn check_h_punishes_gibberish_words() {
+        let mut c = all_off();
+        c.spam.toggle = true;
+        // Keyboard mash: 10+ letters, vowel share < 25% → −100.
+        let (delta, notes) = score_message("shgekskshsjs", &c);
+        assert_eq!(delta, -100);
+        assert!(notes.contains(&"spam".to_string()));
+        // A real long word with normal vowels is not gibberish.
+        let (delta, _) = score_message("watermelon", &c);
+        assert_eq!(delta, 0);
+    }
+
+    #[test]
+    fn check_h_stacks_signals() {
+        let mut c = all_off();
+        c.spam.toggle = true;
+        // Morse wall + emoji spam: both signals → −200.
+        let (delta, notes) = score_message(".... . .-.. .-.. --- 👍👍👍👍👍👍", &c);
+        assert_eq!(delta, -200);
+        assert!(notes.contains(&"spam".to_string()));
+    }
+
+    #[test]
+    fn spam_overlay_round_trips() {
+        let cfg = default_config();
+        let written = flat_map_for_write(&cfg, &serde_json::json!({}), &serde_json::Map::new());
+        assert_eq!(written["spam_score"], 100);
+        assert_eq!(written["spam_emoji_max"], 5);
+        assert_eq!(written["spam_symbol_ratio_pct"], 30);
+        assert_eq!(written["spam_gibberish_word_min"], 8);
+        assert_eq!(written["spam_gibberish_vowel_pct"], 25);
+        let mut overridden = written.clone();
+        overridden.insert("spam_score".to_string(), serde_json::json!(80));
+        overridden.insert("spam_emoji_max".to_string(), serde_json::json!(3));
+        let restored = apply_flat_overlay(default_config(), &overridden);
+        assert_eq!(restored.spam.score, 80);
+        assert_eq!(restored.spam_emoji_max, 3);
     }
 }

@@ -11,8 +11,12 @@
 //!   cargo run --release --features probe --bin score_probe -- --config path/to/config.json
 //!   cargo run --release --features probe --bin score_probe -- --diff other/config.json
 //!   cargo run --release --features probe --bin score_probe -- --corpus my-chat.txt
+//!   cargo run --release --features probe --bin score_probe -- --corpus a.txt --corpus b.txt
 //!
-//! Output: a terminal ASCII histogram + per-rule breakdown, and an SVG chart
+//! Output: a per-corpus comparison table (one column per file — the embedded
+//! "regular" chat corpus plus the bundled `corpus_spam.txt` of gibberish /
+//! morse / emoji spam by default, or any files passed via `--corpus`), a
+//! terminal ASCII histogram, a per-rule breakdown, and an SVG chart
 //! (`score_distribution.svg`) written to the current directory.
 
 use std::collections::BTreeMap;
@@ -179,21 +183,28 @@ const CORPUS: &[CorpusEntry] = &[
 /// A scored corpus sentence.
 struct Scored {
     rule: &'static str,
-    delta: i64,
+    delta: i32,
     notes: Vec<String>,
 }
 
-/// Run the corpus through the real scoring function.
-fn run_corpus(config: &Config, sentences: &[String]) -> Vec<Scored> {
+/// Run a corpus (tagged entries or raw lines) through the real scoring
+/// function. A raw line that matches an embedded entry inherits its rule tag;
+/// anything else is tagged `custom` (or `spam` when it comes from a spam
+/// corpus file).
+fn run_corpus(config: &Config, sentences: &[String], tag: &str) -> Vec<Scored> {
     sentences
         .iter()
         .map(|text| {
             let (delta, notes) = score_message(text, config);
-            let rule = CORPUS
-                .iter()
-                .find(|e| e.text == text)
-                .map(|e| e.rule)
-                .unwrap_or("custom");
+            let rule = if tag == "spam" {
+                "spam"
+            } else {
+                CORPUS
+                    .iter()
+                    .find(|e| e.text == text)
+                    .map(|e| e.rule)
+                    .unwrap_or("custom")
+            };
             Scored {
                 rule,
                 delta,
@@ -204,20 +215,20 @@ fn run_corpus(config: &Config, sentences: &[String]) -> Vec<Scored> {
 }
 
 /// Basic distribution stats over the deltas.
-fn stats(deltas: &[i64]) -> (i64, i64, f64, f64) {
+fn stats(deltas: &[i32]) -> (i32, i32, f32, f32) {
     let n = deltas.len();
     if n == 0 {
         return (0, 0, 0.0, 0.0);
     }
     let min = *deltas.iter().min().unwrap();
     let max = *deltas.iter().max().unwrap();
-    let mean = deltas.iter().sum::<i64>() as f64 / n as f64;
+    let mean = deltas.iter().sum::<i32>() as f32 / n as f32;
     let mut sorted = deltas.to_vec();
     sorted.sort_unstable();
     let median = if n.is_multiple_of(2) {
-        (sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0
+        (sorted[n / 2 - 1] + sorted[n / 2]) as f32 / 2.0
     } else {
-        sorted[n / 2] as f64
+        sorted[n / 2] as f32
     };
     (min, max, mean, median)
 }
@@ -225,7 +236,7 @@ fn stats(deltas: &[i64]) -> (i64, i64, f64, f64) {
 /// Terminal ASCII histogram of the delta distribution.
 fn print_histogram(label: &str, scored: &[Scored]) {
     println!("\n=== {label} ===");
-    let deltas: Vec<i64> = scored.iter().map(|s| s.delta).collect();
+    let deltas: Vec<i32> = scored.iter().map(|s| s.delta).collect();
     let (min, max, mean, median) = stats(&deltas);
     println!(
         "count={}  min={}  max={}  mean={mean:.2}  median={median:.1}",
@@ -235,7 +246,7 @@ fn print_histogram(label: &str, scored: &[Scored]) {
     );
 
     // Bucket by integer delta value.
-    let mut buckets: BTreeMap<i64, usize> = BTreeMap::new();
+    let mut buckets: BTreeMap<i32, usize> = BTreeMap::new();
     for d in &deltas {
         *buckets.entry(*d).or_insert(0) += 1;
     }
@@ -260,6 +271,7 @@ fn print_per_rule(scored: &[Scored], config: &Config) {
         ("run_on", format!("{}+ chars w/o punctuation", config.run_on_chars), config.run_on.toggle),
         ("grouping", format!("{}-char group w/o space", config.grouping_size), config.grouping.toggle),
         ("emoji", "includes emoji".to_string(), config.emoji.toggle),
+        ("spam", "emoji wall / morse / gibberish".to_string(), config.spam.toggle),
     ];
     println!(
         "{:<14} {:<34} {:>6} {:>7} {:>8}",
@@ -267,7 +279,7 @@ fn print_per_rule(scored: &[Scored], config: &Config) {
     );
     for (name, when, toggle) in rules {
         let fired: Vec<&Scored> = scored.iter().filter(|s| s.notes.iter().any(|n| n == name)).collect();
-        let contrib: i64 = fired.iter().map(|s| s.delta).sum();
+        let contrib: i32 = fired.iter().map(|s| s.delta).sum();
         println!(
             "{:<14} {:<34} {:>6} {:>7} {:>8}",
             name,
@@ -296,8 +308,8 @@ fn print_per_rule(scored: &[Scored], config: &Config) {
 
 /// Render the delta distribution as an SVG chart via plotters.
 fn render_svg(scored: &[Scored], out_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let deltas: Vec<i64> = scored.iter().map(|s| s.delta).collect();
-    let mut buckets: BTreeMap<i64, usize> = BTreeMap::new();
+    let deltas: Vec<i32> = scored.iter().map(|s| s.delta).collect();
+    let mut buckets: BTreeMap<i32, usize> = BTreeMap::new();
     for d in &deltas {
         *buckets.entry(*d).or_insert(0) += 1;
     }
@@ -350,8 +362,7 @@ fn load_config(path: Option<&str>) -> Config {
     }
 }
 
-/// Load a custom corpus file (one sentence per line) or fall back to the
-/// embedded corpus.
+/// Load one corpus file (one sentence per line) or the embedded corpus.
 fn load_corpus(path: Option<&str>) -> Vec<String> {
     match path {
         Some(p) => match std::fs::read_to_string(p) {
@@ -378,6 +389,109 @@ fn load_corpus(path: Option<&str>) -> Vec<String> {
     }
 }
 
+/// A named corpus: the display label plus its sentences.
+struct NamedCorpus {
+    label: String,
+    tag: &'static str,
+    sentences: Vec<String>,
+}
+
+/// Build the set of corpora to compare. With no `--corpus` flags the default
+/// is the embedded "regular" corpus plus the bundled `corpus_spam.txt`; each
+/// `--corpus <path>` adds a column named after the file stem.
+fn load_corpora(paths: &[String]) -> Vec<NamedCorpus> {
+    let mut corpora: Vec<NamedCorpus> = Vec::new();
+    if paths.is_empty() {
+        corpora.push(NamedCorpus {
+            label: "regular".to_string(),
+            tag: "regular",
+            sentences: embedded_sentences(),
+        });
+        match std::fs::read_to_string("corpus_spam.txt") {
+            Ok(data) => {
+                let lines: Vec<String> = data
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from)
+                    .collect();
+                if !lines.is_empty() {
+                    corpora.push(NamedCorpus {
+                        label: "spam".to_string(),
+                        tag: "spam",
+                        sentences: lines,
+                    });
+                } else {
+                    eprintln!("warning: corpus_spam.txt is empty — omitting spam column");
+                }
+            }
+            Err(e) => eprintln!("warning: could not read corpus_spam.txt: {e} — omitting spam column"),
+        }
+    } else {
+        for p in paths {
+            let stem = std::path::Path::new(p)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.clone());
+            let tag = if stem.contains("spam") { "spam" } else { "regular" };
+            corpora.push(NamedCorpus {
+                label: stem,
+                tag,
+                sentences: load_corpus(Some(p)),
+            });
+        }
+    }
+    corpora
+}
+
+/// Print one column per corpus: count, min/max, mean, median, and % negative,
+/// so each corpus's trend is visible side by side while tuning.
+fn print_corpus_columns(config: &Config, corpora: &[NamedCorpus]) {
+    println!("\n=== Corpus comparison (one column per file) ===");
+    let scored: Vec<Vec<Scored>> = corpora
+        .iter()
+        .map(|c| run_corpus(config, &c.sentences, c.tag))
+        .collect();
+
+    let mut headers = format!("{:<18}", "metric");
+    for c in corpora {
+        headers.push_str(&format!("{:>14}", c.label));
+    }
+    println!("{headers}");
+
+    type Row = (String, fn(&[Scored]) -> f32, usize);
+    let rows: Vec<Row> = vec![
+        ("count".to_string(), |s| s.len() as f32, 0),
+        ("min".to_string(), |s| s.iter().map(|x| x.delta).min().unwrap_or(0) as f32, 0),
+        ("max".to_string(), |s| s.iter().map(|x| x.delta).max().unwrap_or(0) as f32, 0),
+        ("mean".to_string(), |s| s.iter().map(|x| x.delta).sum::<i32>() as f32 / s.len().max(1) as f32, 2),
+        ("median".to_string(), |s| stats(&s.iter().map(|x| x.delta).collect::<Vec<_>>()).3, 1),
+        (
+            "% negative".to_string(),
+            |s| {
+                let n = s.iter().filter(|x| x.delta < 0).count();
+                n as f32 / s.len().max(1) as f32 * 100.0
+            },
+            1,
+        ),
+    ];
+
+    for (name, f, decimals) in rows {
+        let mut line = format!("{name:<18}");
+        for s in &scored {
+            let v = f(s);
+            let formatted = if decimals == 0 {
+                format!("{:>14}", v as i32)
+            } else {
+                let s = format!("{v:.decimals$}");
+                format!("{s:>14}")
+            };
+            line.push_str(&formatted);
+        }
+        println!("{line}");
+    }
+}
+
 fn embedded_sentences() -> Vec<String> {
     CORPUS.iter().map(|e| e.text.to_string()).collect()
 }
@@ -397,7 +511,7 @@ fn print_config_summary(config: &Config) {
         config.frequency.score
     );
     println!(
-        "max_chars={} punct_cap=+{}/-{} capital_penalty={} repeat_threshold={} run_on={}/{} grouping={} space_ratio_pct={}%",
+        "max_chars={} punct_cap=+{}/-{} capital_penalty={} repeat_threshold={} run_on={}/{} grouping={} space_ratio=+{}/+{} ({}%)",
         config.max_chars,
         config.punct_capital_bonus,
         config.punct_capital_penalty,
@@ -406,6 +520,8 @@ fn print_config_summary(config: &Config) {
         config.run_on_chars,
         config.run_on_window,
         config.grouping_size,
+        config.space_ratio.score,
+        -config.space_ratio_penalty,
         config.space_ratio_pct
     );
 }
@@ -414,15 +530,19 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut config_path: Option<String> = None;
     let mut diff_path: Option<String> = None;
-    let mut corpus_path: Option<String> = None;
+    let mut corpus_paths: Vec<String> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" => config_path = args.next(),
             "--diff" => diff_path = args.next(),
-            "--corpus" => corpus_path = args.next(),
+            "--corpus" => {
+                if let Some(p) = args.next() {
+                    corpus_paths.push(p);
+                }
+            }
             "--help" | "-h" => {
                 println!(
-                    "score_probe: tune score-messages rule weights\n\n  --config <path>  config.json to probe\n  --diff <path>    second config.json to compare\n  --corpus <path>  corpus file (one sentence per line)\n  --help           this message"
+                    "score_probe: tune score-messages rule weights\n\n  --config <path>  config.json to probe\n  --diff <path>    second config.json to compare\n  --corpus <path>  corpus file (repeatable; each adds a comparison column)\n                  (default: embedded 'regular' + corpus_spam.txt)\n  --help           this message"
                 );
                 return;
             }
@@ -430,18 +550,20 @@ fn main() {
         }
     }
 
-    let corpus = load_corpus(corpus_path.as_deref());
-    if corpus.len() < 100 {
+    let corpora = load_corpora(&corpus_paths);
+    let primary = &corpora[0];
+    if primary.sentences.len() < 100 {
         eprintln!(
-            "note: corpus has {} sentences (embedded corpus is 100+)",
-            corpus.len()
+            "note: primary corpus has {} sentences (embedded corpus is 100+)",
+            primary.sentences.len()
         );
     }
 
     let config = load_config(config_path.as_deref());
     print_config_summary(&config);
-    let scored = run_corpus(&config, &corpus);
-    print_histogram("Distribution", &scored);
+    print_corpus_columns(&config, &corpora);
+    let scored = run_corpus(&config, &primary.sentences, primary.tag);
+    print_histogram("Distribution (primary corpus)", &scored);
     print_per_rule(&scored, &config);
     if let Err(e) = render_svg(&scored, "score_distribution.svg") {
         eprintln!("warning: could not render SVG: {e}");
@@ -452,9 +574,9 @@ fn main() {
         let diff_config = load_config(Some(&diff));
         println!("\n\n### DIFF: baseline vs {diff} ###");
         print_config_summary(&diff_config);
-        let scored_b = run_corpus(&diff_config, &corpus);
-        let a: Vec<i64> = scored.iter().map(|s| s.delta).collect();
-        let b: Vec<i64> = scored_b.iter().map(|s| s.delta).collect();
+        let scored_b = run_corpus(&diff_config, &primary.sentences, primary.tag);
+        let a: Vec<i32> = scored.iter().map(|s| s.delta).collect();
+        let b: Vec<i32> = scored_b.iter().map(|s| s.delta).collect();
         let (min_a, max_a, mean_a, med_a) = stats(&a);
         let (min_b, max_b, mean_b, med_b) = stats(&b);
         println!("\n{:<22} {:>10} {:>10} {:>10}", "", "baseline", diff, "shift");
@@ -496,13 +618,14 @@ fn main() {
             "run_on",
             "grouping",
             "emoji",
+            "spam",
         ];
         println!("\n{:<14} {:>10} {:>10} {:>+10}", "rule", "baseline", diff, "contrib shift");
 for rule in rules {
         let a_fired: Vec<&Scored> = scored.iter().filter(|s| s.notes.iter().any(|n| n == rule)).collect();
         let b_fired: Vec<&Scored> = scored_b.iter().filter(|s| s.notes.iter().any(|n| n == rule)).collect();
-        let a_contrib: i64 = a_fired.iter().map(|s| s.delta).sum();
-        let b_contrib: i64 = b_fired.iter().map(|s| s.delta).sum();
+        let a_contrib: i32 = a_fired.iter().map(|s| s.delta).sum();
+        let b_contrib: i32 = b_fired.iter().map(|s| s.delta).sum();
         println!(
             "{:<14} {:>10} {:>10} {:>+10}",
             rule,
@@ -539,13 +662,19 @@ mod tests {
     }
 
     #[test]
-    fn neutral_sentences_reflect_ac_penalties() {
+    fn neutral_sentences_stay_positive_or_near_zero() {
         let cfg = default_config();
-        // Under the AC algorithm a short lowercase message is penalised for
-        // lacking a leading capital (C: −10) and a good space ratio (E: −20).
+        // Tuned for modern chat: lowercase is never penalised, a space-less
+        // short message like "gg" earns +5 from the space-ratio bonus (and
+        // often a trigram or two at +8 each), so a plain lowercase message
+        // lands positive or near zero — never deep in the negative.
         for e in CORPUS.iter().filter(|e| e.rule == "neutral") {
             let (delta, notes) = score_message(e.text, &cfg);
-            assert!(delta <= 0, "neutral '{}' scored positive {delta} ({notes:?})", e.text);
+            assert!(
+                delta >= 0,
+                "neutral '{}' scored {delta} ({notes:?}), expected >= 0",
+                e.text
+            );
         }
     }
 
@@ -596,8 +725,19 @@ mod tests {
         assert_eq!(cfg.repeating.score, -60);
         assert_eq!(cfg.run_on.score, 200);
         // Unmentioned keys fall back to production defaults.
-        assert_eq!(cfg.punctuation.score, 20);
-        assert_eq!(cfg.trigram.score, 3);
+        assert_eq!(cfg.punctuation.score, 30);
+        assert_eq!(cfg.trigram.score, 8);
+        assert_eq!(cfg.capital.score, 30);
+        assert_eq!(cfg.emoji.score, 15);
+        assert_eq!(cfg.capital_penalty, 0);
+        assert_eq!(cfg.punct_capital_penalty, 0);
+        assert_eq!(cfg.space_ratio_penalty, -5);
+        assert_eq!(cfg.space_ratio_pct, 10);
+        assert_eq!(cfg.spam.score, 100);
+        assert_eq!(cfg.spam_emoji_max, 5);
+        assert_eq!(cfg.spam_symbol_ratio_pct, 30);
+        assert_eq!(cfg.spam_gibberish_word_min, 8);
+        assert_eq!(cfg.spam_gibberish_vowel_pct, 25);
         let _ = std::fs::remove_file(path);
     }
 
@@ -609,5 +749,57 @@ mod tests {
         assert_eq!(corpus.len(), 2);
         assert_eq!(corpus[0], "hello world");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn spam_corpus_is_punished_under_defaults() {
+        // The bundled spam corpus must score negative under the production
+        // defaults — exploitation is the counter to the positive bias.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus_spam.txt");
+        let lines: Vec<String> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        assert!(!lines.is_empty(), "corpus_spam.txt should have entries");
+        let cfg = default_config();
+        for line in &lines {
+            let (delta, notes) = score_message(line, &cfg);
+            assert!(
+                delta < 0,
+                "spam '{}' scored {delta} ({notes:?}), expected < 0 under defaults",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn load_corpora_defaults_to_regular_and_spam() {
+        let cwd = std::env::current_dir().unwrap();
+        let _ = std::fs::create_dir_all(&cwd);
+        // Write corpus_spam.txt into the cwd so the default pairing is found.
+        let path = cwd.join("corpus_spam.txt");
+        let had = path.exists();
+        if !had {
+            std::fs::write(&path, "shgekskshsjs\n.... . .-.. .-.. ---\n").unwrap();
+        }
+        let corpora = load_corpora(&[]);
+        assert_eq!(corpora.len(), 2, "regular + spam columns");
+        assert_eq!(corpora[0].label, "regular");
+        assert_eq!(corpora[1].label, "spam");
+        if !had {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn run_corpus_tags_spam_entries() {
+        let cfg = default_config();
+        let scored = run_corpus(&cfg, &["shgekskshsjs".to_string()], "spam");
+        assert_eq!(scored[0].rule, "spam");
+        let scored = run_corpus(&cfg, &["hello".to_string()], "regular");
+        assert_eq!(scored[0].rule, "trigram");
     }
 }

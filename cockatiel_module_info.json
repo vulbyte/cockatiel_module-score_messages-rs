@@ -23,7 +23,7 @@
     "build",
     "--release"
   ],
-  "capabilities": "preprocess",
+  "capabilities": "inprocess",
   "command_flags": [
     "run",
     "--release"
@@ -208,18 +208,48 @@
       "label": "Space Ratio Pct (AC E)",
       "list": false,
       "sensitive": false
+    },
+    {
+      "key": "clamp_toggle",
+      "label": "Clamp Earned Points (enable min/max)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "clamp_min",
+      "label": "Clamp Minimum Delta (0 = no negatives)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "clamp_max",
+      "label": "Clamp Maximum Delta",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "jitter_toggle",
+      "label": "Score Jitter (toggle)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "jitter_percent",
+      "label": "Score Jitter Percent (+/-%)",
+      "list": false,
+      "sensitive": false
     }
   ],
   "description": "preprocess module that scores chat messages with the Animal Crossing (GCN) letter-scoring algorithm (checks: punctuation, trigrams, leading capital, repeating chars, space ratio, run-on sentences, 32-char groupings; plus an optional emoji bonus) and applies the delta to the user's score",
   "launch_command": "cargo",
-  "min_rank": 0,
+  "min_rank": 0.00009999999747378752,
   "name": "score-messages",
   "price": 0,
-  "root_file": "./src/main.rs",
-  "version": "0.1.0",
   "release": {
-    "repo": "vulbyte/cockatiel_module-score_messages-rs",
     "base_url": "https://github.com/vulbyte/cockatiel_module-score_messages-rs/releases/download",
+    "repo": "vulbyte/cockatiel_module-score_messages-rs",
     "tag": "v0.1.0"
-  }
+  },
+  "root_file": "./src/main.rs",
+  "version": "0.1.0"
 }

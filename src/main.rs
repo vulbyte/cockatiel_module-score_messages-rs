@@ -14,8 +14,8 @@ use cockatiel_client::proto::*;
 use cockatiel_client::{CockatielClient, PromptKind};
 
 use score_messages_rs::{
-    apply_flat_overlay, default_config, flat_map_for_write, score_message, viewership_multiplier,
-    Config,
+    apply_flat_overlay, apply_jitter, clamp_delta, default_config, flat_map_for_write,
+    jitter_multiplier, score_message, viewership_multiplier, Config,
 };
 
 type WsWriteHalf = futures_util::stream::SplitSink<
@@ -226,6 +226,24 @@ fn ack_preprocess_container(
     }
 }
 
+/// Build the in-process ACK for a message: pass the stage through unchanged so
+/// it never stalls, echoing the (post-censorship) processed text verbatim —
+/// scoring does not modify the message.
+fn in_process_ack_container(
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    process: MessageInProcess,
+) -> ContainerForEngine {
+    ContainerForEngine {
+        version: 2,
+        auth_token: auth_token.to_string(),
+        module_name: module_name.to_string(),
+        module_instance_uuid7: instance_uuid.to_string(),
+        payload: Some(EnginePayload::MessageInProcess(process)),
+    }
+}
+
 /// Build the adjust-score payload for a scored user. A uuid7-shaped id targets
 /// the user DB row directly; anything else (platform handle) falls back to the
 /// platform+handle pair. The engine's `userdb_adjust_score` applies the REAL
@@ -239,6 +257,153 @@ fn rating_payload(user_id: &str, chat: &ChatMessage, delta: i32, notes: &[String
     } else {
         serde_json::json!({ "platform": chat.platform, "handle": user_id, "delta": delta, "reason": reason })
     }
+}
+
+/// A tiny xorshift64* PRNG — no extra dependency. Seeded from the clock and the
+/// process id at construction so each run (and each reconnect) differs.
+struct Rng(u64);
+
+impl Rng {
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        let seed = nanos ^ (std::process::id() as u64).wrapping_mul(0x2545_F491_4F6C_DD1D);
+        Rng(seed | 1)
+    }
+
+    #[allow(dead_code)]
+    fn from_seed(seed: u64) -> Self {
+        Rng(seed | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// A uniform `f32` in `[-1.0, 1.0)`.
+    fn signed_unit(&mut self) -> f32 {
+        let v = (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32;
+        v * 2.0 - 1.0
+    }
+}
+
+/// Score one in-process message and, when the resulting delta is non-zero,
+/// build the engine's `userdb_adjust_score` DatabaseQuery. The text scored is
+/// the POST-CENSORSHIP `processed_message` when present, so banned-words and
+/// language-constrainer rewrites punish the bad message further; it falls back
+/// to the raw message when there is no processed text. Returns None when there
+/// is nothing to adjust (no raw message, delta == 0, or an empty uuid).
+#[allow(clippy::too_many_arguments)]
+fn in_process_adjust(
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    process: &MessageInProcess,
+    config: &Config,
+    viewers: i32,
+    last_msg: &mut HashMap<String, Instant>,
+    roll: f32,
+) -> Option<ContainerForEngine> {
+    let chat = process.raw_message.as_ref()?;
+    let text = if !process.processed_message.is_empty() {
+        process.processed_message.clone()
+    } else {
+        chat.raw_message.clone()
+    };
+    let user_id = chat.user_uuid7.clone();
+
+    let (mut delta, mut notes) = score_message(&text, config);
+
+    // Frequency: punish posting again too soon after the last message.
+    if config.frequency.toggle && !user_id.is_empty() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(
+            config
+                .frequency
+                .interval_secs
+                .max(config.frequency_interval_floor_secs)
+                as u64,
+        );
+        if let Some(prev) = last_msg.get(&user_id) {
+            if now.duration_since(*prev) < interval {
+                delta += config.frequency.score;
+                notes.push("frequency".into());
+            }
+        }
+        last_msg.insert(user_id.clone(), now);
+        // Bound the frequency map: evict entries older
+        // than the interval, then oldest-first if the
+        // map still exceeds the size cap.
+        last_msg.retain(|_, t| now.duration_since(*t) < interval);
+        if last_msg.len() >= config.last_msg_cap as usize {
+            if let Some(evict) = last_msg
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(k, _)| k.clone())
+            {
+                last_msg.remove(&evict);
+            }
+        }
+    }
+
+    if delta == 0 || process.message_uuid7.is_empty() {
+        return None;
+    }
+
+    // Apply the viewership multiplier: small streams
+    // reward interaction more (peak viewers → a higher
+    // factor up to the configured ceiling). Disabled
+    // when viewership_toggle is off.
+    if config.viewership_toggle {
+        let mult = viewership_multiplier(config, viewers);
+        delta = ((delta as f32) * mult).round() as i32;
+        if delta != 0 {
+            notes.push(format!("viewership x{mult:.2}"));
+        }
+    }
+
+    // Score jitter: randomly scale the EARNED points so farming is harder to
+    // predict. Penalties are never jittered. Applied before the clamp so the
+    // clamp stays the hard bound.
+    if config.jitter_toggle {
+        let before = delta;
+        delta = apply_jitter(delta, config.jitter_percent, roll);
+        if delta != before {
+            notes.push(format!("jitter x{:.2}", jitter_multiplier(config.jitter_percent, roll)));
+        }
+    }
+
+    // Clamp the earned delta to the configured range, if enabled.
+    delta = clamp_delta(config, delta);
+
+    // Apply the real signed delta via the engine's
+    // score-only virtual query (no ±1 clamp, no
+    // rating-counter inflation, no cooldown).
+    let query_id = "userdb_adjust_score";
+    let payload = rating_payload(&user_id, chat, delta, &notes);
+    let query = ContainerForEngine {
+        version: 2,
+        auth_token: auth_token.to_string(),
+        module_name: module_name.to_string(),
+        module_instance_uuid7: instance_uuid.to_string(),
+        payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
+            query_id: query_id.to_string(),
+            sql: payload.to_string(),
+            params: vec![],
+        })),
+    };
+    warn!(
+        "[score] uuid={} delta={} notes={:?} ({} user={})",
+        process.message_uuid7, delta, notes, query_id, user_id
+    );
+    Some(query)
 }
 
 
@@ -287,6 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut read = read;
         tokio::spawn(async move {
             let mut last_msg: HashMap<String, Instant> = HashMap::new();
+            let mut rng = Rng::new();
             'reconnect: loop {
                 loop {
                     let Some(msg) = read.next().await else { break };
@@ -344,102 +510,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 };
                                 send_container(&write_shared, receipt).await;
                             }
-                            // ACK on EVERY path: the engine advances the
+                            // Pass-through ack: the engine advances the
                             // pre-process stage only when every tracked
                             // recipient replies with the same message_uuid7.
-                            // Echo the raw ChatMessage back whether we scored
-                            // it or not (delta==0, empty uuid, or error).
-                            let Some(chat) = &raw_message else {
-                                send_container(
-                                    &write_shared,
-                                    ack_preprocess_container(
-                                        &auth_token,
-                                        &module_name,
-                                        &instance_uuid,
-                                        uuid,
-                                        None,
-                                        audio,
-                                        audio_type,
-                                    ),
-                                )
-                                .await;
-                                continue;
-                            };
-                            let config = config_shared.lock().unwrap().clone();
-                            let text = chat.raw_message.clone();
-                            let user_id = chat.user_uuid7.clone();
-
-                            let (mut delta, mut notes) = score_message(&text, &config);
-
-                            // Frequency: punish posting again too soon after the last message.
-                            if config.frequency.toggle && !user_id.is_empty() {
-                                let now = Instant::now();
-                                let interval = Duration::from_secs(
-                                    config
-                                        .frequency
-                                        .interval_secs
-                                        .max(config.frequency_interval_floor_secs)
-                                        as u64,
-                                );
-                                if let Some(prev) = last_msg.get(&user_id) {
-                                    if now.duration_since(*prev) < interval {
-                                        delta += config.frequency.score;
-                                        notes.push("frequency".into());
-                                    }
-                                }
-                                last_msg.insert(user_id.clone(), now);
-                                // Bound the frequency map: evict entries older
-                                // than the interval, then oldest-first if the
-                                // map still exceeds the size cap.
-                                last_msg.retain(|_, t| now.duration_since(*t) < interval);
-                                if last_msg.len() >= config.last_msg_cap as usize {
-                                    if let Some(evict) = last_msg
-                                        .iter()
-                                        .min_by_key(|(_, t)| **t)
-                                        .map(|(k, _)| k.clone())
-                                    {
-                                        last_msg.remove(&evict);
-                                    }
-                                }
-                            }
-
-                            if delta != 0 && !uuid.is_empty() {
-                                // Apply the viewership multiplier: small streams
-                                // reward interaction more (peak viewers → a higher
-                                // factor up to the configured ceiling). Disabled
-                                // when viewership_toggle is off.
-                                if config.viewership_toggle {
-                                    let viewers = *viewers_shared.lock().unwrap();
-                                    let mult = viewership_multiplier(&config, viewers);
-                                    delta = ((delta as f32) * mult).round() as i32;
-                                    if delta != 0 {
-                                        notes.push(format!("viewership x{mult:.2}"));
-                                    }
-                                }
-                                // Apply the real signed delta via the engine's
-                                // score-only virtual query (no ±1 clamp, no
-                                // rating-counter inflation, no cooldown).
-                                let query_id = "userdb_adjust_score";
-                                let payload = rating_payload(&user_id, chat, delta, &notes);
-                                let query = ContainerForEngine {
-                                    version: 2,
-                                    auth_token: auth_token.clone(),
-                                    module_name: module_name.clone(),
-                                    module_instance_uuid7: instance_uuid.clone(),
-                                    payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
-                                        query_id: query_id.to_string(),
-                                        sql: payload.to_string(),
-                                        params: vec![],
-                                    })),
-                                };
-                                send_container(&write_shared, query).await;
-                                warn!(
-                                    "[score] uuid={} delta={} notes={:?} ({} user={})",
-                                    uuid, delta, notes, query_id, user_id
-                                );
-                            }
-
-                            // Always ack so the engine advances the stage.
+                            // This module scores in-process, so echo the raw
+                            // ChatMessage back unchanged.
                             send_container(
                                 &write_shared,
                                 ack_preprocess_container(
@@ -447,7 +522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &module_name,
                                     &instance_uuid,
                                     uuid,
-                                    Some(chat.clone()),
+                                    raw_message,
                                     audio,
                                     audio_type,
                                 ),
@@ -467,24 +542,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 };
                                 send_container(&write_shared, receipt).await;
                             }
+                            if process.raw_message.is_none() {
+                                // No raw ChatMessage: pass through unchanged.
+                                send_container(
+                                    &write_shared,
+                                    in_process_ack_container(
+                                        &auth_token,
+                                        &module_name,
+                                        &instance_uuid,
+                                        process,
+                                    ),
+                                )
+                                .await;
+                                continue;
+                            }
+                            // Score the POST-CENSORSHIP text so censorship
+                            // patterns (banned-words / language-constrainer)
+                            // punish bad messages further.
+                            let config = config_shared.lock().unwrap().clone();
+                            let viewers = *viewers_shared.lock().unwrap();
+                            let roll = rng.signed_unit();
+                            if let Some(query) = in_process_adjust(
+                                &auth_token,
+                                &module_name,
+                                &instance_uuid,
+                                &process,
+                                &config,
+                                viewers,
+                                &mut last_msg,
+                                roll,
+                            ) {
+                                send_container(&write_shared, query).await;
+                            }
                             // Pass-through ack of the in-process stage so it
-                            // never stalls (even though this module only
-                            // declares pre-process capability).
-                            let ack = ContainerForEngine {
-                                version: 2,
-                                auth_token: auth_token.clone(),
-                                module_name: module_name.clone(),
-                                module_instance_uuid7: instance_uuid.clone(),
-                                payload: Some(EnginePayload::MessageInProcess(MessageInProcess {
-                                    message_uuid7: process.message_uuid7,
-                                    raw_message: process.raw_message,
-                                    processed_message: process.processed_message,
-                                    abandon_message: process.abandon_message,
-                                    audio: process.audio,
-                                    audio_type: process.audio_type,
-                                })),
-                            };
-                            send_container(&write_shared, ack).await;
+                            // never stalls, echoing the processed message
+                            // unchanged (scoring does not modify text).
+                            send_container(
+                                &write_shared,
+                                in_process_ack_container(
+                                    &auth_token,
+                                    &module_name,
+                                    &instance_uuid,
+                                    process,
+                                ),
+                            )
+                            .await;
                         }
                         _ => {}
                     }
@@ -532,6 +634,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::time::sleep(Duration::from_secs(poll as u64)).await;
                 // Re-read the poll interval from the live config on each cycle.
                 poll = config_shared.lock().unwrap().viewership_poll_secs.max(1);
+                // Skip polling while the multiplier is off: there is nothing to
+                // drive, and the extra same-name connection would displace the
+                // engine's primary sender and destabilise the module.
+                if !config_shared.lock().unwrap().viewership_toggle {
+                    continue;
+                }
                 if let Ok(conn) = CockatielClient::connect("config.json").await {
                     let (w, mut r) = conn.stream.split();
                         let write = Arc::new(AsyncMutex::new(w));
@@ -656,5 +764,244 @@ mod tests {
         assert_eq!(p["platform"], "twitch");
         assert_eq!(p["handle"], "some_chatter");
         assert_eq!(p["delta"], 3);
+    }
+
+    fn sample_process(message: &str, raw: Option<ChatMessage>) -> MessageInProcess {
+        MessageInProcess {
+            message_uuid7: "msg-uuid".to_string(),
+            raw_message: raw,
+            processed_message: message.to_string(),
+            abandon_message: false,
+            audio: Vec::new(),
+            audio_type: String::new(),
+        }
+    }
+
+    /// A config with every AC check off except the leading-capital rule, so a
+    /// capitalised censored message yields a deterministic +30 delta.
+    fn capital_only_config() -> Config {
+        let mut config = default_config();
+        for r in [
+            &mut config.punctuation,
+            &mut config.trigram,
+            &mut config.repeating,
+            &mut config.space_ratio,
+            &mut config.run_on,
+            &mut config.grouping,
+            &mut config.emoji,
+            &mut config.spam,
+        ] {
+            r.toggle = false;
+        }
+        config.capital.toggle = true;
+        config.frequency.toggle = false;
+        config
+    }
+
+    #[test]
+    fn in_process_scores_censored_text_and_emits_adjust_query() {
+        let chat = sample_chat("0189a0c1-1111-4222-8333-444455556666");
+        let config = capital_only_config();
+        let mut last_msg = HashMap::new();
+        // The post-censorship text is the one scored ("AAAAAAAA" -> capital
+        // reward, +30), not the raw "hello".
+        let process = sample_process("AAAAAAAA", Some(chat.clone()));
+
+        let query = in_process_adjust(
+            "tok",
+            "score-messages",
+            "inst",
+            &process,
+            &config,
+            0,
+            &mut last_msg,
+            0.0,
+        )
+        .expect("non-zero delta must emit an adjust query");
+
+        let Some(EnginePayload::DatabaseQuery(q)) = query.payload else {
+            panic!("expected a DatabaseQuery container");
+        };
+        assert_eq!(q.query_id, "userdb_adjust_score");
+        let payload: serde_json::Value = serde_json::from_str(&q.sql).unwrap();
+        assert_eq!(payload["uuid7"], chat.user_uuid7);
+        assert_eq!(payload["delta"], 30);
+
+        // A pass-through ack is produced with the processed message unchanged.
+        let ack = in_process_ack_container("tok", "score-messages", "inst", process);
+        let Some(EnginePayload::MessageInProcess(m)) = ack.payload else {
+            panic!("expected a MessageInProcess ack");
+        };
+        assert_eq!(m.message_uuid7, "msg-uuid");
+        assert_eq!(m.processed_message, "AAAAAAAA");
+        assert!(!m.abandon_message);
+    }
+
+    #[test]
+    fn in_process_zero_delta_emits_no_query() {
+        let chat = sample_chat("0189a0c1-1111-4222-8333-444455556666");
+        let mut config = capital_only_config();
+        config.capital.toggle = false;
+        let mut last_msg = HashMap::new();
+        let process = sample_process("hello there", Some(chat));
+        assert!(in_process_adjust(
+            "tok",
+            "score-messages",
+            "inst",
+            &process,
+            &config,
+            0,
+            &mut last_msg,
+            0.0,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn in_process_adjust_ignores_missing_raw_message() {
+        let config = capital_only_config();
+        let mut last_msg = HashMap::new();
+        let process = sample_process("AAAAAAAA", None);
+        assert!(in_process_adjust(
+            "tok",
+            "score-messages",
+            "inst",
+            &process,
+            &config,
+            0,
+            &mut last_msg,
+            0.0,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn in_process_falls_back_to_raw_message_when_unprocessed() {
+        let mut chat = sample_chat("0189a0c1-1111-4222-8333-444455556666");
+        chat.raw_message = "Hello".to_string();
+        let config = capital_only_config();
+        let mut last_msg = HashMap::new();
+        let process = sample_process("", Some(chat));
+        let query = in_process_adjust(
+            "tok",
+            "score-messages",
+            "inst",
+            &process,
+            &config,
+            0,
+            &mut last_msg,
+            0.0,
+        )
+        .expect("raw fallback should still score");
+        let Some(EnginePayload::DatabaseQuery(q)) = query.payload else {
+            panic!("expected a DatabaseQuery container");
+        };
+        let payload: serde_json::Value = serde_json::from_str(&q.sql).unwrap();
+        assert_eq!(payload["delta"], 30);
+    }
+
+    #[test]
+    fn in_process_clamps_final_delta_when_enabled() {
+        let chat = sample_chat("0189a0c1-1111-4222-8333-444455556666");
+        let mut config = capital_only_config();
+        config.clamp_toggle = true;
+        config.clamp_max = 5;
+        let mut last_msg = HashMap::new();
+        let process = sample_process("AAAAAAAA", Some(chat.clone()));
+
+        let query = in_process_adjust(
+            "tok",
+            "score-messages",
+            "inst",
+            &process,
+            &config,
+            0,
+            &mut last_msg,
+            0.0,
+        )
+        .expect("clamped delta must still emit an adjust query");
+        let Some(EnginePayload::DatabaseQuery(q)) = query.payload else {
+            panic!("expected a DatabaseQuery container");
+        };
+        let payload: serde_json::Value = serde_json::from_str(&q.sql).unwrap();
+        assert_eq!(payload["delta"], 5);
+
+        // With clamping off the +30 delta is preserved.
+        let mut config = capital_only_config();
+        config.clamp_toggle = false;
+        config.clamp_max = 5;
+        let mut last_msg = HashMap::new();
+        let query = in_process_adjust(
+            "tok",
+            "score-messages",
+            "inst",
+            &process,
+            &config,
+            0,
+            &mut last_msg,
+            0.0,
+        )
+        .expect("unclamped delta must emit an adjust query");
+        let Some(EnginePayload::DatabaseQuery(q)) = query.payload else {
+            panic!("expected a DatabaseQuery container");
+        };
+        let payload: serde_json::Value = serde_json::from_str(&q.sql).unwrap();
+        assert_eq!(payload["delta"], 30);
+    }
+
+    fn jittered_delta(config: &Config, roll: f32) -> i32 {
+        let chat = sample_chat("0189a0c1-1111-4222-8333-444455556666");
+        let mut last_msg = HashMap::new();
+        let process = sample_process("AAAAAAAA", Some(chat));
+        let query = in_process_adjust(
+            "tok",
+            "score-messages",
+            "inst",
+            &process,
+            config,
+            0,
+            &mut last_msg,
+            roll,
+        )
+        .expect("jittered gain must emit an adjust query");
+        let Some(EnginePayload::DatabaseQuery(q)) = query.payload else {
+            panic!("expected a DatabaseQuery container");
+        };
+        let payload: serde_json::Value = serde_json::from_str(&q.sql).unwrap();
+        payload["delta"].as_i64().unwrap() as i32
+    }
+
+    #[test]
+    fn in_process_applies_jitter_to_gains_only() {
+        // A +30 delta is scaled by the roll: round(30 * 1.3) = 39,
+        // round(30 * 0.7) = 21, and roll 0.0 leaves it unchanged.
+        let mut config = capital_only_config();
+        config.jitter_toggle = true;
+        config.jitter_percent = 30;
+        assert_eq!(jittered_delta(&config, 1.0), 39);
+        assert_eq!(jittered_delta(&config, -1.0), 21);
+        assert_eq!(jittered_delta(&config, 0.0), 30);
+
+        // The clamp remains the hard bound: jitter up (+30 → 39) still clamps.
+        let mut config = capital_only_config();
+        config.jitter_toggle = true;
+        config.jitter_percent = 30;
+        config.clamp_toggle = true;
+        config.clamp_max = 5;
+        assert_eq!(jittered_delta(&config, 1.0), 5);
+    }
+
+    #[test]
+    fn rng_signed_unit_is_bounded_and_seed_is_deterministic() {
+        let mut rng = Rng::new();
+        for _ in 0..10_000 {
+            let v = rng.signed_unit();
+            assert!((-1.0..1.0).contains(&v), "signed_unit out of range: {v}");
+        }
+        let mut a = Rng::from_seed(0x1234_5678_9ABC_DEF0);
+        let mut b = Rng::from_seed(0x1234_5678_9ABC_DEF0);
+        for _ in 0..100 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
     }
 }

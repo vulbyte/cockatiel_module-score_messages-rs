@@ -65,7 +65,10 @@ pub struct Rule {
 
 impl Default for Rule {
     fn default() -> Self {
-        Self { toggle: true, score: 20 }
+        Self {
+            toggle: true,
+            score: 20,
+        }
     }
 }
 
@@ -203,6 +206,23 @@ pub struct Config {
     pub last_msg_cap: u32,
     #[serde(default = "default_prompt_timeout_secs")]
     pub prompt_timeout_secs: u32,
+    /// Clamp the per-message score delta to [`clamp_min`, `clamp_max`] when on.
+    #[serde(default)]
+    pub clamp_toggle: bool,
+    /// Lowest score delta a message may apply (0 = earnings can never go
+    /// negative while clamping is on).
+    #[serde(default = "default_clamp_min")]
+    pub clamp_min: i32,
+    /// Highest score delta a single message may apply.
+    #[serde(default = "default_clamp_max")]
+    pub clamp_max: i32,
+    /// Randomly scale a message's EARNED points by ±`jitter_percent`% so farming
+    /// is harder to predict. Penalties are never jittered.
+    #[serde(default)]
+    pub jitter_toggle: bool,
+    /// Maximum jitter deviation, in percent (clamped to 0..=100).
+    #[serde(default = "default_jitter_percent")]
+    pub jitter_percent: i32,
     #[serde(default = "default_reconnect_base_secs")]
     pub reconnect_base_secs: u32,
     #[serde(default = "default_reconnect_max_secs")]
@@ -210,31 +230,58 @@ pub struct Config {
 }
 
 fn default_punctuation() -> Rule {
-    Rule { toggle: true, score: 30 }
+    Rule {
+        toggle: true,
+        score: 30,
+    }
 }
 fn default_trigram() -> Rule {
-    Rule { toggle: true, score: 8 }
+    Rule {
+        toggle: true,
+        score: 8,
+    }
 }
 fn default_capital() -> Rule {
-    Rule { toggle: true, score: 30 }
+    Rule {
+        toggle: true,
+        score: 30,
+    }
 }
 fn default_repeating() -> Rule {
-    Rule { toggle: true, score: 50 }
+    Rule {
+        toggle: true,
+        score: 50,
+    }
 }
 fn default_space_ratio() -> Rule {
-    Rule { toggle: true, score: 25 }
+    Rule {
+        toggle: true,
+        score: 25,
+    }
 }
 fn default_run_on() -> Rule {
-    Rule { toggle: true, score: 150 }
+    Rule {
+        toggle: true,
+        score: 150,
+    }
 }
 fn default_grouping() -> Rule {
-    Rule { toggle: true, score: 20 }
+    Rule {
+        toggle: true,
+        score: 20,
+    }
 }
 fn default_emoji() -> Rule {
-    Rule { toggle: true, score: 15 }
+    Rule {
+        toggle: true,
+        score: 15,
+    }
 }
 fn default_spam() -> Rule {
-    Rule { toggle: true, score: 100 }
+    Rule {
+        toggle: true,
+        score: 100,
+    }
 }
 
 pub fn default_spam_emoji_max() -> i32 {
@@ -300,6 +347,15 @@ pub fn default_last_msg_cap() -> u32 {
 pub fn default_prompt_timeout_secs() -> u32 {
     60
 }
+pub fn default_clamp_min() -> i32 {
+    0
+}
+pub fn default_clamp_max() -> i32 {
+    10_000
+}
+pub fn default_jitter_percent() -> i32 {
+    30
+}
 pub fn default_reconnect_base_secs() -> u32 {
     1
 }
@@ -309,7 +365,10 @@ pub fn default_reconnect_max_secs() -> u32 {
 
 pub fn default_config() -> Config {
     Config {
-        punctuation: Rule { toggle: true, score: 30 },
+        punctuation: Rule {
+            toggle: true,
+            score: 30,
+        },
         trigram: default_trigram(),
         trigram_table_path: String::new(),
         capital: default_capital(),
@@ -341,6 +400,11 @@ pub fn default_config() -> Config {
         frequency_interval_floor_secs: default_frequency_interval_floor_secs(),
         last_msg_cap: default_last_msg_cap(),
         prompt_timeout_secs: default_prompt_timeout_secs(),
+        clamp_toggle: false,
+        clamp_min: default_clamp_min(),
+        clamp_max: default_clamp_max(),
+        jitter_toggle: false,
+        jitter_percent: default_jitter_percent(),
         reconnect_base_secs: default_reconnect_base_secs(),
         reconnect_max_secs: default_reconnect_max_secs(),
     }
@@ -418,7 +482,10 @@ pub fn parse_u32(v: Option<&serde_json::Value>) -> Option<u32> {
 }
 
 /// Overlay the engine's flat module_specific credential keys onto a Config.
-pub fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_json::Value>) -> Config {
+pub fn apply_flat_overlay(
+    mut cfg: Config,
+    ms: &serde_json::Map<String, serde_json::Value>,
+) -> Config {
     macro_rules! apply_rule {
         ($field:ident, $prefix:literal) => {
             if let Some(t) = parse_toggle(ms.get(concat!($prefix, "_toggle"))) {
@@ -514,6 +581,21 @@ pub fn apply_flat_overlay(mut cfg: Config, ms: &serde_json::Map<String, serde_js
     if let Some(v) = parse_u64(ms.get("reconnect_max_secs")) {
         cfg.reconnect_max_secs = v as u32;
     }
+    if let Some(t) = parse_toggle(ms.get("clamp_toggle")) {
+        cfg.clamp_toggle = t;
+    }
+    if let Some(v) = parse_score(ms.get("clamp_min")) {
+        cfg.clamp_min = v as i32;
+    }
+    if let Some(v) = parse_score(ms.get("clamp_max")) {
+        cfg.clamp_max = v as i32;
+    }
+    if let Some(t) = parse_toggle(ms.get("jitter_toggle")) {
+        cfg.jitter_toggle = t;
+    }
+    if let Some(v) = parse_score(ms.get("jitter_percent")) {
+        cfg.jitter_percent = v as i32;
+    }
     cfg
 }
 
@@ -534,7 +616,9 @@ pub fn flat_map_for_write(
             let toggle_key = concat!($prefix, "_toggle");
             let score_key = concat!($prefix, "_score");
             let toggle = parse_toggle(ms.get(toggle_key)).unwrap_or(cfg.$field.toggle);
-            let score = parse_score(ms.get(score_key)).map(|s| s as i32).unwrap_or(cfg.$field.score);
+            let score = parse_score(ms.get(score_key))
+                .map(|s| s as i32)
+                .unwrap_or(cfg.$field.score);
             out.insert(toggle_key.to_string(), serde_json::Value::Bool(toggle));
             out.insert(score_key.to_string(), serde_json::json!(score));
         };
@@ -543,7 +627,8 @@ pub fn flat_map_for_write(
     put_rule!(trigram, "trigram");
     out.insert(
         "trigram_table_path".to_string(),
-        serde_json::json!(ms.get("trigram_table_path")
+        serde_json::json!(ms
+            .get("trigram_table_path")
             .and_then(|v| v.as_str())
             .unwrap_or(&cfg.trigram_table_path)),
     );
@@ -552,9 +637,9 @@ pub fn flat_map_for_write(
     put_rule!(space_ratio, "space_ratio");
     out.insert(
         "space_ratio_penalty".to_string(),
-        serde_json::json!(
-            parse_score(ms.get("space_ratio_penalty")).map(|s| s as i32).unwrap_or(cfg.space_ratio_penalty)
-        ),
+        serde_json::json!(parse_score(ms.get("space_ratio_penalty"))
+            .map(|s| s as i32)
+            .unwrap_or(cfg.space_ratio_penalty)),
     );
     put_rule!(run_on, "run_on");
     put_rule!(grouping, "grouping");
@@ -568,21 +653,20 @@ pub fn flat_map_for_write(
     );
     out.insert(
         "spam_symbol_ratio_pct".to_string(),
-        serde_json::json!(
-            parse_score(ms.get("spam_symbol_ratio_pct")).map(|s| s as i32).unwrap_or(cfg.spam_symbol_ratio_pct)
-        ),
+        serde_json::json!(parse_score(ms.get("spam_symbol_ratio_pct"))
+            .map(|s| s as i32)
+            .unwrap_or(cfg.spam_symbol_ratio_pct)),
     );
     out.insert(
         "spam_gibberish_word_min".to_string(),
-        serde_json::json!(
-            parse_score(ms.get("spam_gibberish_word_min")).unwrap_or(cfg.spam_gibberish_word_min as i64)
-        ),
+        serde_json::json!(parse_score(ms.get("spam_gibberish_word_min"))
+            .unwrap_or(cfg.spam_gibberish_word_min as i64)),
     );
     out.insert(
         "spam_gibberish_vowel_pct".to_string(),
-        serde_json::json!(
-            parse_score(ms.get("spam_gibberish_vowel_pct")).map(|s| s as i32).unwrap_or(cfg.spam_gibberish_vowel_pct)
-        ),
+        serde_json::json!(parse_score(ms.get("spam_gibberish_vowel_pct"))
+            .map(|s| s as i32)
+            .unwrap_or(cfg.spam_gibberish_vowel_pct)),
     );
     put_rule!(frequency, "frequency");
     out.insert(
@@ -593,24 +677,29 @@ pub fn flat_map_for_write(
     );
     out.insert(
         "viewership_max_viewers".to_string(),
-        serde_json::json!(
-            parse_score(ms.get("viewership_max_viewers")).map(|s| s as i32).unwrap_or(cfg.viewership_max_viewers)
-        ),
+        serde_json::json!(parse_score(ms.get("viewership_max_viewers"))
+            .map(|s| s as i32)
+            .unwrap_or(cfg.viewership_max_viewers)),
     );
     out.insert(
         "viewership_multiplier_max".to_string(),
-        serde_json::json!(
-            parse_f64(ms.get("viewership_multiplier_max")).map(|v| v as f32).unwrap_or(cfg.viewership_multiplier_max)
-        ),
+        serde_json::json!(parse_f64(ms.get("viewership_multiplier_max"))
+            .map(|v| v as f32)
+            .unwrap_or(cfg.viewership_multiplier_max)),
     );
     out.insert(
         "viewership_poll_secs".to_string(),
-        serde_json::json!(
-            parse_u64(ms.get("viewership_poll_secs")).map(|v| v as u32).unwrap_or(cfg.viewership_poll_secs)
-        ),
+        serde_json::json!(parse_u64(ms.get("viewership_poll_secs"))
+            .map(|v| v as u32)
+            .unwrap_or(cfg.viewership_poll_secs)),
     );
-    let interval = parse_u64(ms.get("frequency_interval_secs")).map(|v| v as u32).unwrap_or(cfg.frequency.interval_secs);
-    out.insert("frequency_interval_secs".to_string(), serde_json::json!(interval));
+    let interval = parse_u64(ms.get("frequency_interval_secs"))
+        .map(|v| v as u32)
+        .unwrap_or(cfg.frequency.interval_secs);
+    out.insert(
+        "frequency_interval_secs".to_string(),
+        serde_json::json!(interval),
+    );
     macro_rules! put_scalar {
         ($key:literal, $parse:ident, $cfg_val:expr) => {{
             let v = $parse(ms.get($key)).unwrap_or($cfg_val);
@@ -621,10 +710,22 @@ pub fn flat_map_for_write(
     put_scalar!("grouping_size", parse_usize, cfg.grouping_size);
     put_scalar!("space_ratio_pct", parse_i64, cfg.space_ratio_pct as i64);
     put_scalar!("max_chars", parse_usize, cfg.max_chars);
-    put_scalar!("punct_capital_bonus", parse_i64, cfg.punct_capital_bonus as i64);
-    put_scalar!("punct_capital_penalty", parse_i64, cfg.punct_capital_penalty as i64);
+    put_scalar!(
+        "punct_capital_bonus",
+        parse_i64,
+        cfg.punct_capital_bonus as i64
+    );
+    put_scalar!(
+        "punct_capital_penalty",
+        parse_i64,
+        cfg.punct_capital_penalty as i64
+    );
     put_scalar!("capital_penalty", parse_i64, cfg.capital_penalty as i64);
-    put_scalar!("repeating_threshold", parse_usize, cfg.repeating_threshold as usize);
+    put_scalar!(
+        "repeating_threshold",
+        parse_usize,
+        cfg.repeating_threshold as usize
+    );
     put_scalar!("run_on_window", parse_usize, cfg.run_on_window as usize);
     put_scalar!(
         "frequency_interval_floor_secs",
@@ -633,16 +734,39 @@ pub fn flat_map_for_write(
     );
     put_scalar!("last_msg_cap", parse_usize, cfg.last_msg_cap as usize);
     put_scalar!("prompt_timeout_secs", parse_u32, cfg.prompt_timeout_secs);
-    put_scalar!("reconnect_base_secs", parse_u64, cfg.reconnect_base_secs as u64);
-    put_scalar!("reconnect_max_secs", parse_u64, cfg.reconnect_max_secs as u64);
+    put_scalar!(
+        "reconnect_base_secs",
+        parse_u64,
+        cfg.reconnect_base_secs as u64
+    );
+    put_scalar!(
+        "reconnect_max_secs",
+        parse_u64,
+        cfg.reconnect_max_secs as u64
+    );
+    out.insert(
+        "clamp_toggle".to_string(),
+        serde_json::Value::Bool(
+            parse_toggle(ms.get("clamp_toggle")).unwrap_or(cfg.clamp_toggle),
+        ),
+    );
+    put_scalar!("clamp_min", parse_i64, cfg.clamp_min as i64);
+    put_scalar!("clamp_max", parse_i64, cfg.clamp_max as i64);
+    out.insert(
+        "jitter_toggle".to_string(),
+        serde_json::Value::Bool(
+            parse_toggle(ms.get("jitter_toggle")).unwrap_or(cfg.jitter_toggle),
+        ),
+    );
+    put_scalar!("jitter_percent", parse_i64, cfg.jitter_percent as i64);
     out
 }
 
 /// Resolve a Config from a config.json root the same way the live module does.
 pub fn config_from_root(root: &serde_json::Value) -> Config {
     if let Some(ms) = root.get("module_specific").and_then(|v| v.as_object()) {
-        let legacy = serde_json::from_value::<Config>(root.clone())
-            .unwrap_or_else(|_| default_config());
+        let legacy =
+            serde_json::from_value::<Config>(root.clone()).unwrap_or_else(|_| default_config());
         return apply_flat_overlay(legacy, ms);
     }
     if let Ok(cfg) = serde_json::from_value::<Config>(root.clone()) {
@@ -803,7 +927,9 @@ impl TrigramTable {
         match value {
             serde_json::Value::Array(items) => {
                 for item in items {
-                    let s = item.as_str().ok_or("JSON trigram table rows must be strings")?;
+                    let s = item
+                        .as_str()
+                        .ok_or("JSON trigram table rows must be strings")?;
                     table.insert_trigram(s)?;
                 }
             }
@@ -844,7 +970,8 @@ impl TrigramTable {
             if parts.len() == 1 && i == 0 && parts[0].eq_ignore_ascii_case("trigram") {
                 continue; // header row: "trigram"
             }
-            if parts.len() == 2 && i == 0
+            if parts.len() == 2
+                && i == 0
                 && parts[0].eq_ignore_ascii_case("letter")
                 && parts[1].eq_ignore_ascii_case("suffix")
             {
@@ -885,7 +1012,11 @@ impl TrigramTable {
             let Some(letter) = current else {
                 continue;
             };
-            table.suffixes.entry(letter).or_default().insert(line.to_string());
+            table
+                .suffixes
+                .entry(letter)
+                .or_default()
+                .insert(line.to_string());
         }
         Ok(table)
     }
@@ -894,7 +1025,9 @@ impl TrigramTable {
         let trigram = trigram.trim();
         let chars: Vec<char> = trigram.chars().collect();
         if chars.len() != 3 {
-            return Err(format!("trigram entries must be exactly 3 chars, got {trigram:?}"));
+            return Err(format!(
+                "trigram entries must be exactly 3 chars, got {trigram:?}"
+            ));
         }
         let letter = chars[0].to_ascii_uppercase();
         let suffix: String = chars[1..].iter().collect();
@@ -917,7 +1050,8 @@ static EXTERNAL_TRIGRAMS: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn external_trigram_table(path: &str) -> Option<std::sync::Arc<TrigramTable>> {
-    let cache = EXTERNAL_TRIGRAMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache =
+        EXTERNAL_TRIGRAMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut cache = cache.lock().unwrap();
     if let Some(t) = cache.get(path) {
         return Some(t.clone());
@@ -1001,7 +1135,11 @@ fn check_c(input: &str, cfg: &Config) -> i32 {
 /// Check D — Repeating characters. −50 if any letter repeats 3+ times
 /// sequentially (spaces removed first, per the game).
 fn check_d(input: &str, cfg: &Config) -> i32 {
-    let trimmed: String = input.trim_matches([' ', '\t']).chars().filter(|c| *c != ' ').collect();
+    let trimmed: String = input
+        .trim_matches([' ', '\t'])
+        .chars()
+        .filter(|c| *c != ' ')
+        .collect();
     let chars: Vec<char> = trimmed.chars().collect();
     let mut run = 0u32;
     let mut prev: Option<char> = None;
@@ -1206,7 +1344,6 @@ pub fn score_message(message: &str, cfg: &Config) -> (i32, Vec<String>) {
             notes.push("spam".into());
         }
     }
-
     (delta, notes)
 }
 
@@ -1223,6 +1360,34 @@ pub fn viewership_multiplier(cfg: &Config, viewers: i32) -> f32 {
     let viewers = viewers.max(1); // 0/offline treated as the smallest audience
     let raw = max_viewers as f32 / viewers as f32;
     raw.clamp(1.0, cfg.viewership_multiplier_max.max(1.0))
+}
+
+/// Clamp a score delta to the configured `[clamp_min, clamp_max]` range when the
+/// toggle is on. A no-op when the toggle is off or the range is inverted
+/// (`clamp_min > clamp_max`) — never panics.
+pub fn clamp_delta(cfg: &Config, delta: i32) -> i32 {
+    if cfg.clamp_toggle && cfg.clamp_min <= cfg.clamp_max {
+        delta.clamp(cfg.clamp_min, cfg.clamp_max)
+    } else {
+        delta
+    }
+}
+
+/// The jitter multiplier for a random `roll` in `[-1.0, 1.0]` and a deviation
+/// `percent` (clamped to 0..=100): `1.0 + roll * percent/100`.
+pub fn jitter_multiplier(percent: i32, roll: f32) -> f32 {
+    let p = percent.clamp(0, 100) as f32 / 100.0;
+    1.0 + roll.clamp(-1.0, 1.0) * p
+}
+
+/// Apply score jitter to a delta. Only GAINS (positive deltas) are scaled;
+/// penalties and zero are returned unchanged. The scaled gain is rounded and
+/// floored at 1 so a real gain never becomes a non-gain.
+pub fn apply_jitter(delta: i32, percent: i32, roll: f32) -> i32 {
+    if delta <= 0 {
+        return delta;
+    }
+    ((delta as f32) * jitter_multiplier(percent, roll)).round().max(1.0) as i32
 }
 
 #[cfg(test)]
@@ -1278,11 +1443,7 @@ mod tests {
 
     #[test]
     fn external_trigram_table_loads_json_array() {
-        let table = TrigramTable::load_from_str(
-            r#"["the", "and", "hel"]"#,
-            "table.json",
-        )
-        .unwrap();
+        let table = TrigramTable::load_from_str(r#"["the", "and", "hel"]"#, "table.json").unwrap();
         assert!(table.contains('t', "he"), "the -> t+he");
         assert!(table.contains('a', "nd"), "and -> a+nd");
         assert!(table.contains('h', "el"), "hel -> h+el");
@@ -1293,11 +1454,9 @@ mod tests {
 
     #[test]
     fn external_trigram_table_loads_json_object() {
-        let table = TrigramTable::load_from_str(
-            r#"{"t": ["he", "hr"], "a": ["nd", "re"]}"#,
-            "table.json",
-        )
-        .unwrap();
+        let table =
+            TrigramTable::load_from_str(r#"{"t": ["he", "hr"], "a": ["nd", "re"]}"#, "table.json")
+                .unwrap();
         assert!(table.contains('t', "he"));
         assert!(table.contains('t', "hr"));
         assert!(table.contains('a', "re"));
@@ -1307,11 +1466,8 @@ mod tests {
     #[test]
     fn external_trigram_table_loads_csv() {
         // Rows of letter,suffix plus a full-trigram column, with a header row.
-        let table = TrigramTable::load_from_str(
-            "letter,suffix\nt,he\na,nd\nthr\n",
-            "table.csv",
-        )
-        .unwrap();
+        let table =
+            TrigramTable::load_from_str("letter,suffix\nt,he\na,nd\nthr\n", "table.csv").unwrap();
         assert!(table.contains('t', "he"));
         assert!(table.contains('a', "nd"));
         assert!(table.contains('t', "hr"), "thr -> t+hr");
@@ -1320,8 +1476,7 @@ mod tests {
 
     #[test]
     fn external_trigram_table_loads_text_sections() {
-        let table = TrigramTable::load_from_str("~T~\nhe\nhr\n~A~\nnd\n", "table.txt")
-            .unwrap();
+        let table = TrigramTable::load_from_str("~T~\nhe\nhr\n~A~\nnd\n", "table.txt").unwrap();
         assert!(table.contains('t', "he"));
         assert!(table.contains('a', "nd"));
         assert!(!table.contains('t', "nd"), "strict per-letter matching");
@@ -1479,7 +1634,10 @@ mod tests {
         overridden.insert("repeating_threshold".to_string(), serde_json::json!(5));
         overridden.insert("viewership_toggle".to_string(), serde_json::json!(true));
         overridden.insert("viewership_max_viewers".to_string(), serde_json::json!(500));
-        overridden.insert("viewership_multiplier_max".to_string(), serde_json::json!(2.5));
+        overridden.insert(
+            "viewership_multiplier_max".to_string(),
+            serde_json::json!(2.5),
+        );
         let restored = apply_flat_overlay(default_config(), &overridden);
         assert_eq!(restored.run_on_chars, 60);
         assert_eq!(restored.space_ratio_pct, 30);
@@ -1627,5 +1785,84 @@ mod tests {
         let restored = apply_flat_overlay(default_config(), &overridden);
         assert_eq!(restored.spam.score, 80);
         assert_eq!(restored.spam_emoji_max, 3);
+    }
+
+    #[test]
+    fn clamp_delta_off_is_unchanged() {
+        let mut cfg = default_config();
+        cfg.clamp_toggle = false;
+        cfg.clamp_min = 0;
+        cfg.clamp_max = 5;
+        assert_eq!(clamp_delta(&cfg, -100), -100);
+        assert_eq!(clamp_delta(&cfg, 30), 30);
+    }
+
+    #[test]
+    fn clamp_delta_on_within_range_is_unchanged() {
+        let mut cfg = default_config();
+        cfg.clamp_toggle = true;
+        cfg.clamp_min = 0;
+        cfg.clamp_max = 100;
+        assert_eq!(clamp_delta(&cfg, 30), 30);
+        assert_eq!(clamp_delta(&cfg, 0), 0);
+        assert_eq!(clamp_delta(&cfg, 100), 100);
+    }
+
+    #[test]
+    fn clamp_delta_on_below_min_is_min() {
+        let mut cfg = default_config();
+        cfg.clamp_toggle = true;
+        cfg.clamp_min = 0;
+        cfg.clamp_max = 100;
+        assert_eq!(clamp_delta(&cfg, -100), 0);
+    }
+
+    #[test]
+    fn clamp_delta_on_above_max_is_max() {
+        let mut cfg = default_config();
+        cfg.clamp_toggle = true;
+        cfg.clamp_min = 0;
+        cfg.clamp_max = 5;
+        assert_eq!(clamp_delta(&cfg, 30), 5);
+    }
+
+    #[test]
+    fn clamp_delta_inverted_range_is_unchanged() {
+        let mut cfg = default_config();
+        cfg.clamp_toggle = true;
+        cfg.clamp_min = 50;
+        cfg.clamp_max = 10;
+        assert_eq!(clamp_delta(&cfg, 30), 30);
+        assert_eq!(clamp_delta(&cfg, -100), -100);
+    }
+
+    #[test]
+    fn apply_jitter_zero_roll_is_unchanged() {
+        assert_eq!(apply_jitter(30, 30, 0.0), 30);
+    }
+
+    #[test]
+    fn apply_jitter_scales_gains() {
+        assert_eq!(apply_jitter(30, 30, 1.0), 39);
+        assert_eq!(apply_jitter(30, 30, -1.0), 21);
+    }
+
+    #[test]
+    fn apply_jitter_leaves_penalties_and_zero_unchanged() {
+        assert_eq!(apply_jitter(-30, 30, 1.0), -30);
+        assert_eq!(apply_jitter(-30, 30, -1.0), -30);
+        assert_eq!(apply_jitter(0, 30, 1.0), 0);
+        assert_eq!(apply_jitter(0, 30, -1.0), 0);
+    }
+
+    #[test]
+    fn apply_jitter_never_zeroes_a_gain() {
+        assert_eq!(apply_jitter(1, 30, -1.0), 1);
+    }
+
+    #[test]
+    fn jitter_multiplier_clamps_percent() {
+        assert_eq!(jitter_multiplier(1000, 1.0), 2.0);
+        assert_eq!(jitter_multiplier(-5, 1.0), 1.0);
     }
 }

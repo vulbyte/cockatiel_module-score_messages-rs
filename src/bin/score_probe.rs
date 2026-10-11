@@ -179,7 +179,6 @@ const CORPUS: &[CorpusEntry] = &[
     Entry("punctuation", "Does anyone else think the new update is really good and worth trying out?"),
 ];
 
-
 /// A scored corpus sentence.
 struct Scored {
     rule: &'static str,
@@ -205,11 +204,7 @@ fn run_corpus(config: &Config, sentences: &[String], tag: &str) -> Vec<Scored> {
                     .map(|e| e.rule)
                     .unwrap_or("custom")
             };
-            Scored {
-                rule,
-                delta,
-                notes,
-            }
+            Scored { rule, delta, notes }
         })
         .collect()
 }
@@ -263,22 +258,57 @@ fn print_histogram(label: &str, scored: &[Scored]) {
 fn print_per_rule(scored: &[Scored], config: &Config) {
     println!("\n=== Per-rule contribution (across the whole corpus) ===");
     let rules = [
-        ("punctuation", "ends with .!? / caps after punct".to_string(), config.punctuation.toggle),
-        ("trigram", "valid word-start trigrams".to_string(), config.trigram.toggle),
-        ("capital", "leading capital".to_string(), config.capital.toggle),
-        ("repeating", "letter repeated 3+ times".to_string(), config.repeating.toggle),
-        ("space_ratio", format!("spaces >= {}% of non-space", config.space_ratio_pct), config.space_ratio.toggle),
-        ("run_on", format!("{}+ chars w/o punctuation", config.run_on_chars), config.run_on.toggle),
-        ("grouping", format!("{}-char group w/o space", config.grouping_size), config.grouping.toggle),
+        (
+            "punctuation",
+            "ends with .!? / caps after punct".to_string(),
+            config.punctuation.toggle,
+        ),
+        (
+            "trigram",
+            "valid word-start trigrams".to_string(),
+            config.trigram.toggle,
+        ),
+        (
+            "capital",
+            "leading capital".to_string(),
+            config.capital.toggle,
+        ),
+        (
+            "repeating",
+            "letter repeated 3+ times".to_string(),
+            config.repeating.toggle,
+        ),
+        (
+            "space_ratio",
+            format!("spaces >= {}% of non-space", config.space_ratio_pct),
+            config.space_ratio.toggle,
+        ),
+        (
+            "run_on",
+            format!("{}+ chars w/o punctuation", config.run_on_chars),
+            config.run_on.toggle,
+        ),
+        (
+            "grouping",
+            format!("{}-char group w/o space", config.grouping_size),
+            config.grouping.toggle,
+        ),
         ("emoji", "includes emoji".to_string(), config.emoji.toggle),
-        ("spam", "emoji wall / morse / gibberish".to_string(), config.spam.toggle),
+        (
+            "spam",
+            "emoji wall / morse / gibberish".to_string(),
+            config.spam.toggle,
+        ),
     ];
     println!(
         "{:<14} {:<34} {:>6} {:>7} {:>8}",
         "rule", "fires when", "toggle", "hit #", "contrib"
     );
     for (name, when, toggle) in rules {
-        let fired: Vec<&Scored> = scored.iter().filter(|s| s.notes.iter().any(|n| n == name)).collect();
+        let fired: Vec<&Scored> = scored
+            .iter()
+            .filter(|s| s.notes.iter().any(|n| n == name))
+            .collect();
         let contrib: i32 = fired.iter().map(|s| s.delta).sum();
         println!(
             "{:<14} {:<34} {:>6} {:>7} {:>8}",
@@ -320,7 +350,10 @@ fn render_svg(scored: &[Scored], out_path: &str) -> Result<(), Box<dyn std::erro
     let root = SVGBackend::new(out_path, (900, 600)).into_drawing_area();
     root.fill(&WHITE)?;
     let mut chart = ChartBuilder::on(&root)
-        .caption("Message score distribution (score-messages)", ("sans-serif", 24))
+        .caption(
+            "Message score distribution (score-messages)",
+            ("sans-serif", 24),
+        )
         .margin(20)
         .x_label_area_size(40)
         .y_label_area_size(60)
@@ -425,7 +458,9 @@ fn load_corpora(paths: &[String]) -> Vec<NamedCorpus> {
                     eprintln!("warning: corpus_spam.txt is empty — omitting spam column");
                 }
             }
-            Err(e) => eprintln!("warning: could not read corpus_spam.txt: {e} — omitting spam column"),
+            Err(e) => {
+                eprintln!("warning: could not read corpus_spam.txt: {e} — omitting spam column")
+            }
         }
     } else {
         for p in paths {
@@ -433,7 +468,11 @@ fn load_corpora(paths: &[String]) -> Vec<NamedCorpus> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.clone());
-            let tag = if stem.contains("spam") { "spam" } else { "regular" };
+            let tag = if stem.contains("spam") {
+                "spam"
+            } else {
+                "regular"
+            };
             corpora.push(NamedCorpus {
                 label: stem,
                 tag,
@@ -462,10 +501,26 @@ fn print_corpus_columns(config: &Config, corpora: &[NamedCorpus]) {
     type Row = (String, fn(&[Scored]) -> f32, usize);
     let rows: Vec<Row> = vec![
         ("count".to_string(), |s| s.len() as f32, 0),
-        ("min".to_string(), |s| s.iter().map(|x| x.delta).min().unwrap_or(0) as f32, 0),
-        ("max".to_string(), |s| s.iter().map(|x| x.delta).max().unwrap_or(0) as f32, 0),
-        ("mean".to_string(), |s| s.iter().map(|x| x.delta).sum::<i32>() as f32 / s.len().max(1) as f32, 2),
-        ("median".to_string(), |s| stats(&s.iter().map(|x| x.delta).collect::<Vec<_>>()).3, 1),
+        (
+            "min".to_string(),
+            |s| s.iter().map(|x| x.delta).min().unwrap_or(0) as f32,
+            0,
+        ),
+        (
+            "max".to_string(),
+            |s| s.iter().map(|x| x.delta).max().unwrap_or(0) as f32,
+            0,
+        ),
+        (
+            "mean".to_string(),
+            |s| s.iter().map(|x| x.delta).sum::<i32>() as f32 / s.len().max(1) as f32,
+            2,
+        ),
+        (
+            "median".to_string(),
+            |s| stats(&s.iter().map(|x| x.delta).collect::<Vec<_>>()).3,
+            1,
+        ),
         (
             "% negative".to_string(),
             |s| {
@@ -579,7 +634,10 @@ fn main() {
         let b: Vec<i32> = scored_b.iter().map(|s| s.delta).collect();
         let (min_a, max_a, mean_a, med_a) = stats(&a);
         let (min_b, max_b, mean_b, med_b) = stats(&b);
-        println!("\n{:<22} {:>10} {:>10} {:>10}", "", "baseline", diff, "shift");
+        println!(
+            "\n{:<22} {:>10} {:>10} {:>10}",
+            "", "baseline", diff, "shift"
+        );
         println!(
             "{:<22} {:>10} {:>10} {:>10}",
             "min",
@@ -620,21 +678,30 @@ fn main() {
             "emoji",
             "spam",
         ];
-        println!("\n{:<14} {:>10} {:>10} {:>+10}", "rule", "baseline", diff, "contrib shift");
-for rule in rules {
-        let a_fired: Vec<&Scored> = scored.iter().filter(|s| s.notes.iter().any(|n| n == rule)).collect();
-        let b_fired: Vec<&Scored> = scored_b.iter().filter(|s| s.notes.iter().any(|n| n == rule)).collect();
-        let a_contrib: i32 = a_fired.iter().map(|s| s.delta).sum();
-        let b_contrib: i32 = b_fired.iter().map(|s| s.delta).sum();
         println!(
-            "{:<14} {:>10} {:>10} {:>+10}",
-            rule,
-            a_contrib,
-            b_contrib,
-            b_contrib - a_contrib
+            "\n{:<14} {:>10} {:>10} {:>+10}",
+            "rule", "baseline", diff, "contrib shift"
         );
+        for rule in rules {
+            let a_fired: Vec<&Scored> = scored
+                .iter()
+                .filter(|s| s.notes.iter().any(|n| n == rule))
+                .collect();
+            let b_fired: Vec<&Scored> = scored_b
+                .iter()
+                .filter(|s| s.notes.iter().any(|n| n == rule))
+                .collect();
+            let a_contrib: i32 = a_fired.iter().map(|s| s.delta).sum();
+            let b_contrib: i32 = b_fired.iter().map(|s| s.delta).sum();
+            println!(
+                "{:<14} {:>10} {:>10} {:>+10}",
+                rule,
+                a_contrib,
+                b_contrib,
+                b_contrib - a_contrib
+            );
+        }
     }
-}
 }
 
 #[cfg(test)]
@@ -649,15 +716,18 @@ mod tests {
     #[test]
     fn every_corpus_tag_is_a_real_rule() {
         let known = [
-            "neutral", "punctuation", "trigram", "capital", "repeating",
-            "space_ratio", "run_on", "grouping", "emoji",
+            "neutral",
+            "punctuation",
+            "trigram",
+            "capital",
+            "repeating",
+            "space_ratio",
+            "run_on",
+            "grouping",
+            "emoji",
         ];
         for e in CORPUS {
-            assert!(
-                known.contains(&e.rule),
-                "unknown corpus tag {:?}",
-                e.rule
-            );
+            assert!(known.contains(&e.rule), "unknown corpus tag {:?}", e.rule);
         }
     }
 
@@ -683,7 +753,11 @@ mod tests {
         let cfg = default_config();
         let repeating = CORPUS.iter().find(|e| e.rule == "repeating").unwrap();
         let (delta, notes) = score_message(repeating.text, &cfg);
-        assert!(delta < 0, "repeating '{}' should be punished, got {delta}", repeating.text);
+        assert!(
+            delta < 0,
+            "repeating '{}' should be punished, got {delta}",
+            repeating.text
+        );
         assert!(notes.contains(&"repeating".to_string()));
     }
 
@@ -692,7 +766,11 @@ mod tests {
         let cfg = default_config();
         let punct = CORPUS.iter().find(|e| e.rule == "punctuation").unwrap();
         let (delta, notes) = score_message(punct.text, &cfg);
-        assert!(delta > 0, "punctuation '{}' should be rewarded, got {delta}", punct.text);
+        assert!(
+            delta > 0,
+            "punctuation '{}' should be rewarded, got {delta}",
+            punct.text
+        );
         assert!(notes.contains(&"punctuation".to_string()));
     }
 

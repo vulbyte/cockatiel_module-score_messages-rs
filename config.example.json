@@ -49,6 +49,6 @@
     "last_msg_cap": 10000,
     "prompt_timeout_secs": 60,
     "reconnect_base_secs": 1,
-    "reconnect_max_secs": 30
+    "reconnect_max_secs": 90
   }
 }

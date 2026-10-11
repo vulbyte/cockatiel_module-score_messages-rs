@@ -360,7 +360,7 @@ pub fn default_reconnect_base_secs() -> u32 {
     1
 }
 pub fn default_reconnect_max_secs() -> u32 {
-    30
+    90
 }
 
 pub fn default_config() -> Config {
@@ -746,17 +746,13 @@ pub fn flat_map_for_write(
     );
     out.insert(
         "clamp_toggle".to_string(),
-        serde_json::Value::Bool(
-            parse_toggle(ms.get("clamp_toggle")).unwrap_or(cfg.clamp_toggle),
-        ),
+        serde_json::Value::Bool(parse_toggle(ms.get("clamp_toggle")).unwrap_or(cfg.clamp_toggle)),
     );
     put_scalar!("clamp_min", parse_i64, cfg.clamp_min as i64);
     put_scalar!("clamp_max", parse_i64, cfg.clamp_max as i64);
     out.insert(
         "jitter_toggle".to_string(),
-        serde_json::Value::Bool(
-            parse_toggle(ms.get("jitter_toggle")).unwrap_or(cfg.jitter_toggle),
-        ),
+        serde_json::Value::Bool(parse_toggle(ms.get("jitter_toggle")).unwrap_or(cfg.jitter_toggle)),
     );
     put_scalar!("jitter_percent", parse_i64, cfg.jitter_percent as i64);
     out
@@ -1387,7 +1383,9 @@ pub fn apply_jitter(delta: i32, percent: i32, roll: f32) -> i32 {
     if delta <= 0 {
         return delta;
     }
-    ((delta as f32) * jitter_multiplier(percent, roll)).round().max(1.0) as i32
+    ((delta as f32) * jitter_multiplier(percent, roll))
+        .round()
+        .max(1.0) as i32
 }
 
 #[cfg(test)]

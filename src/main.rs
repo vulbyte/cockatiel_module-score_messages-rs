@@ -19,9 +19,7 @@ use score_messages_rs::{
 };
 
 type WsWriteHalf = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMessage,
 >;
 
@@ -191,7 +189,10 @@ async fn load_config(
 
 /// Encode and send a Container on the shared write half (used by the read loop
 /// and the config prompts alike).
-async fn send_container(write_shared: &Arc<AsyncMutex<WsWriteHalf>>, container: ContainerForEngine) {
+async fn send_container(
+    write_shared: &Arc<AsyncMutex<WsWriteHalf>>,
+    container: ContainerForEngine,
+) {
     let mut buf = Vec::new();
     if container.encode(&mut buf).is_ok() {
         let mut w = write_shared.lock().await;
@@ -248,10 +249,14 @@ fn in_process_ack_container(
 /// the user DB row directly; anything else (platform handle) falls back to the
 /// platform+handle pair. The engine's `userdb_adjust_score` applies the REAL
 /// signed delta to `score` without touching the human-rating counters.
-fn rating_payload(user_id: &str, chat: &ChatMessage, delta: i32, notes: &[String]) -> serde_json::Value {
+fn rating_payload(
+    user_id: &str,
+    chat: &ChatMessage,
+    delta: i32,
+    notes: &[String],
+) -> serde_json::Value {
     let reason = format!("score-messages: {}", notes.join(","));
-    let uuid7_shaped =
-        user_id.chars().filter(|c| *c == '-').count() == 4 && user_id.len() == 36;
+    let uuid7_shaped = user_id.chars().filter(|c| *c == '-').count() == 4 && user_id.len() == 36;
     if uuid7_shaped {
         serde_json::json!({ "uuid7": user_id, "delta": delta, "reason": reason })
     } else {
@@ -328,8 +333,7 @@ fn in_process_adjust(
             config
                 .frequency
                 .interval_secs
-                .max(config.frequency_interval_floor_secs)
-                as u64,
+                .max(config.frequency_interval_floor_secs) as u64,
         );
         if let Some(prev) = last_msg.get(&user_id) {
             if now.duration_since(*prev) < interval {
@@ -376,7 +380,10 @@ fn in_process_adjust(
         let before = delta;
         delta = apply_jitter(delta, config.jitter_percent, roll);
         if delta != before {
-            notes.push(format!("jitter x{:.2}", jitter_multiplier(config.jitter_percent, roll)));
+            notes.push(format!(
+                "jitter x{:.2}",
+                jitter_multiplier(config.jitter_percent, roll)
+            ));
         }
     }
 
@@ -406,7 +413,6 @@ fn in_process_adjust(
     Some(query)
 }
 
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -432,8 +438,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Arc<Mutex> that is populated right after load_config returns.
     let config_shared: Arc<Mutex<Config>> = Arc::new(Mutex::new(default_config()));
 
-    // Cached peak viewer count across platforms (fed by the viewer-poll task,
-    // used to scale score deltas by the viewership multiplier).
+    // Cached peak viewer count across platforms (fed by the read loop's
+    // viewership poll, used to scale score deltas by the viewership multiplier).
     let viewers_shared: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
 
     // Read task: forward PromptResponses to the awaiting prompt AND handle
@@ -453,142 +459,188 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             let mut last_msg: HashMap<String, Instant> = HashMap::new();
             let mut rng = Rng::new();
+            let mut poll_secs = config_shared.lock().unwrap().viewership_poll_secs.max(1);
+            let mut next_poll = tokio::time::Instant::now() + Duration::from_secs(poll_secs as u64);
             'reconnect: loop {
                 loop {
-                    let Some(msg) = read.next().await else { break };
-                    let data = match msg {
-                        Ok(WsMessage::Binary(d)) => d,
-                        Ok(WsMessage::Close(_)) => {
-                            info!("Engine closed connection");
-                            break;
-                        }
-                        Ok(_) => continue,
-                        Err(e) => {
-                            warn!("Engine WebSocket error: {}", e);
-                            break;
-                        }
-                    };
-                    let Ok(container) = ContainerForModule::decode(data.as_ref()) else { continue };
-
-                    match container.payload {
-                        Some(ModulePayload::PromptResponse(resp)) => {
-                            // Forward operator answers to the awaiting prompt.
-                            let _ = prompt_tx_task.send(resp);
-                        }
-                        Some(ModulePayload::AuthVerify(_)) => {
-                            // Answer the engine's liveness probe with our auth token
-                            // so a quiet period never severs us (this module does
-                            // nothing during dead air, so it would otherwise be
-                            // flagged unresponsive and killed on a schedule).
-                            let reply = ContainerForEngine {
-                                version: 2,
-                                auth_token: auth_token.clone(),
-                                module_name: module_name.clone(),
-                                module_instance_uuid7: instance_uuid.clone(),
-                                payload: Some(EnginePayload::AuthVerify(AuthVerify {
-                                    cur_auth: auth_token.clone(),
-                                })),
+                    tokio::select! {
+                        msg = read.next() => {
+                            let Some(msg) = msg else { break };
+                            let data = match msg {
+                                Ok(WsMessage::Binary(d)) => d,
+                                Ok(WsMessage::Close(_)) => {
+                                    info!("Engine closed connection");
+                                    break;
+                                }
+                                Ok(_) => continue,
+                                Err(e) => {
+                                    warn!("Engine WebSocket error: {}", e);
+                                    break;
+                                }
                             };
-                            send_container(&write_shared, reply).await;
-                        }
-                        Some(ModulePayload::MessagePreProcess(pre)) => {
-                            let MessagePreProcess {
-                                message_uuid7: uuid,
-                                raw_message,
-                                audio,
-                                audio_type,
-                            } = pre;
-                            if !uuid.is_empty() {
-                                let receipt = ContainerForEngine {
-                                    version: 2,
-                                    auth_token: auth_token.clone(),
-                                    module_name: module_name.clone(),
-                                    module_instance_uuid7: instance_uuid.clone(),
-                                    payload: Some(EnginePayload::MessageAck(MessageAck {
-                                        message_uuid7: uuid.clone(),
-                                    })),
-                                };
-                                send_container(&write_shared, receipt).await;
-                            }
-                            // Pass-through ack: the engine advances the
-                            // pre-process stage only when every tracked
-                            // recipient replies with the same message_uuid7.
-                            // This module scores in-process, so echo the raw
-                            // ChatMessage back unchanged.
-                            send_container(
-                                &write_shared,
-                                ack_preprocess_container(
-                                    &auth_token,
-                                    &module_name,
-                                    &instance_uuid,
-                                    uuid,
-                                    raw_message,
-                                    audio,
-                                    audio_type,
-                                ),
-                            )
-                            .await;
-                        }
-                        Some(ModulePayload::MessageInProcess(process)) => {
-                            if !process.message_uuid7.is_empty() {
-                                let receipt = ContainerForEngine {
-                                    version: 2,
-                                    auth_token: auth_token.clone(),
-                                    module_name: module_name.clone(),
-                                    module_instance_uuid7: instance_uuid.clone(),
-                                    payload: Some(EnginePayload::MessageAck(MessageAck {
-                                        message_uuid7: process.message_uuid7.clone(),
-                                    })),
-                                };
-                                send_container(&write_shared, receipt).await;
-                            }
-                            if process.raw_message.is_none() {
-                                // No raw ChatMessage: pass through unchanged.
-                                send_container(
-                                    &write_shared,
-                                    in_process_ack_container(
+                            let Ok(container) = ContainerForModule::decode(data.as_ref()) else { continue };
+
+                            match container.payload {
+                                Some(ModulePayload::PromptResponse(resp)) => {
+                                    // Forward operator answers to the awaiting prompt.
+                                    let _ = prompt_tx_task.send(resp);
+                                }
+                                Some(ModulePayload::AuthVerify(_)) => {
+                                    // Answer the engine's liveness probe with our auth token
+                                    // so a quiet period never severs us (this module does
+                                    // nothing during dead air, so it would otherwise be
+                                    // flagged unresponsive and killed on a schedule).
+                                    let reply = ContainerForEngine {
+                                        version: 2,
+                                        auth_token: auth_token.clone(),
+                                        module_name: module_name.clone(),
+                                        module_instance_uuid7: instance_uuid.clone(),
+                                        payload: Some(EnginePayload::AuthVerify(AuthVerify {
+                                            cur_auth: auth_token.clone(),
+                                        })),
+                                    };
+                                    send_container(&write_shared, reply).await;
+                                }
+                                Some(ModulePayload::MessagePreProcess(pre)) => {
+                                    let MessagePreProcess {
+                                        message_uuid7: uuid,
+                                        raw_message,
+                                        audio,
+                                        audio_type,
+                                    } = pre;
+                                    if !uuid.is_empty() {
+                                        let receipt = ContainerForEngine {
+                                            version: 2,
+                                            auth_token: auth_token.clone(),
+                                            module_name: module_name.clone(),
+                                            module_instance_uuid7: instance_uuid.clone(),
+                                            payload: Some(EnginePayload::MessageAck(MessageAck {
+                                                message_uuid7: uuid.clone(),
+                                            })),
+                                        };
+                                        send_container(&write_shared, receipt).await;
+                                    }
+                                    // Pass-through ack: the engine advances the
+                                    // pre-process stage only when every tracked
+                                    // recipient replies with the same message_uuid7.
+                                    // This module scores in-process, so echo the raw
+                                    // ChatMessage back unchanged.
+                                    send_container(
+                                        &write_shared,
+                                        ack_preprocess_container(
+                                            &auth_token,
+                                            &module_name,
+                                            &instance_uuid,
+                                            uuid,
+                                            raw_message,
+                                            audio,
+                                            audio_type,
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                Some(ModulePayload::MessageInProcess(process)) => {
+                                    if !process.message_uuid7.is_empty() {
+                                        let receipt = ContainerForEngine {
+                                            version: 2,
+                                            auth_token: auth_token.clone(),
+                                            module_name: module_name.clone(),
+                                            module_instance_uuid7: instance_uuid.clone(),
+                                            payload: Some(EnginePayload::MessageAck(MessageAck {
+                                                message_uuid7: process.message_uuid7.clone(),
+                                            })),
+                                        };
+                                        send_container(&write_shared, receipt).await;
+                                    }
+                                    if process.raw_message.is_none() {
+                                        // No raw ChatMessage: pass through unchanged.
+                                        send_container(
+                                            &write_shared,
+                                            in_process_ack_container(
+                                                &auth_token,
+                                                &module_name,
+                                                &instance_uuid,
+                                                process,
+                                            ),
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    // Score the POST-CENSORSHIP text so censorship
+                                    // patterns (banned-words / language-constrainer)
+                                    // punish bad messages further.
+                                    let config = config_shared.lock().unwrap().clone();
+                                    let viewers = *viewers_shared.lock().unwrap();
+                                    let roll = rng.signed_unit();
+                                    if let Some(query) = in_process_adjust(
                                         &auth_token,
                                         &module_name,
                                         &instance_uuid,
-                                        process,
-                                    ),
-                                )
-                                .await;
-                                continue;
+                                        &process,
+                                        &config,
+                                        viewers,
+                                        &mut last_msg,
+                                        roll,
+                                    ) {
+                                        send_container(&write_shared, query).await;
+                                    }
+                                    // Pass-through ack of the in-process stage so it
+                                    // never stalls, echoing the processed message
+                                    // unchanged (scoring does not modify text).
+                                    send_container(
+                                        &write_shared,
+                                        in_process_ack_container(
+                                            &auth_token,
+                                            &module_name,
+                                            &instance_uuid,
+                                            process,
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                Some(ModulePayload::DatabaseQueryResult(res))
+                                    if res.query_id == "channel_viewers" =>
+                                {
+                                    // Peak viewer count across all channels.
+                                    let mut peak = 0i32;
+                                    if let Ok(json) =
+                                        serde_json::from_slice::<serde_json::Value>(&res.result_blob)
+                                    {
+                                        if let Some(channels) =
+                                            json.get("channels").and_then(|c| c.as_array())
+                                        {
+                                            for ch in channels {
+                                                if let Some(v) = ch.get("viewers").and_then(|v| v.as_i64()) {
+                                                    peak = peak.max(v as i32);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    *viewers_shared.lock().unwrap() = peak;
+                                }
+                                _ => {}
                             }
-                            // Score the POST-CENSORSHIP text so censorship
-                            // patterns (banned-words / language-constrainer)
-                            // punish bad messages further.
+                        }
+                        _ = tokio::time::sleep_until(next_poll) => {
                             let config = config_shared.lock().unwrap().clone();
-                            let viewers = *viewers_shared.lock().unwrap();
-                            let roll = rng.signed_unit();
-                            if let Some(query) = in_process_adjust(
-                                &auth_token,
-                                &module_name,
-                                &instance_uuid,
-                                &process,
-                                &config,
-                                viewers,
-                                &mut last_msg,
-                                roll,
-                            ) {
+                            poll_secs = config.viewership_poll_secs.max(1);
+                            next_poll = tokio::time::Instant::now()
+                                + Duration::from_secs(poll_secs as u64);
+                            if config.viewership_toggle {
+                                let query = ContainerForEngine {
+                                    version: 2,
+                                    auth_token: auth_token.clone(),
+                                    module_name: module_name.clone(),
+                                    module_instance_uuid7: instance_uuid.clone(),
+                                    payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
+                                        query_id: "channel_viewers".to_string(),
+                                        sql: "{}".to_string(),
+                                        params: vec![],
+                                    })),
+                                };
                                 send_container(&write_shared, query).await;
                             }
-                            // Pass-through ack of the in-process stage so it
-                            // never stalls, echoing the processed message
-                            // unchanged (scoring does not modify text).
-                            send_container(
-                                &write_shared,
-                                in_process_ack_container(
-                                    &auth_token,
-                                    &module_name,
-                                    &instance_uuid,
-                                    process,
-                                ),
-                            )
-                            .await;
                         }
-                        _ => {}
                     }
                 }
 
@@ -615,99 +667,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             backoff = (backoff * 2).min(reconnect_cfg.reconnect_max_secs);
                         }
                     }
-                }
-            }
-        });
-    }
-
-    // Viewer-poll task: every `viewership_poll_secs`, query the engine's
-    // `channel_viewers` surface and cache the peak viewer count across all
-    // platforms. Runs its own connection (the read task owns the main socket).
-    // The multiplier only applies when the viewership modifier is enabled, so
-    // the task is cheap when off (single query per interval, best-effort).
-    {
-        let viewers_shared = Arc::clone(&viewers_shared);
-        let config_shared = Arc::clone(&config_shared);
-        tokio::spawn(async move {
-            let mut poll = config_shared.lock().unwrap().viewership_poll_secs.max(1);
-            loop {
-                tokio::time::sleep(Duration::from_secs(poll as u64)).await;
-                // Re-read the poll interval from the live config on each cycle.
-                poll = config_shared.lock().unwrap().viewership_poll_secs.max(1);
-                // Skip polling while the multiplier is off: there is nothing to
-                // drive, and the extra same-name connection would displace the
-                // engine's primary sender and destabilise the module.
-                if !config_shared.lock().unwrap().viewership_toggle {
-                    continue;
-                }
-                if let Ok(conn) = CockatielClient::connect("config.json").await {
-                    let (w, mut r) = conn.stream.split();
-                        let write = Arc::new(AsyncMutex::new(w));
-                        let query = ContainerForEngine {
-                            version: 2,
-                            auth_token: conn.auth_token.clone(),
-                            module_name: conn.config.module_name.clone(),
-                            module_instance_uuid7: conn.instance_uuid7.clone(),
-                            payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
-                                query_id: "channel_viewers".to_string(),
-                                sql: "{}".to_string(),
-                                params: vec![],
-                            })),
-                        };
-                        send_container(&write, query).await;
-                        // Wait briefly for the answer, answering liveness probes.
-                        let deadline = tokio::time::Instant::now()
-                            + Duration::from_secs((poll * 2).max(10) as u64);
-                        while tokio::time::Instant::now() < deadline {
-                            let Ok(Some(msg)) = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                r.next(),
-                            )
-                            .await
-                            else {
-                                break;
-                            };
-                            let Ok(WsMessage::Binary(d)) = msg else { continue };
-                            let Ok(c) = ContainerForModule::decode(d.as_ref()) else { continue };
-                            match c.payload {
-                                Some(ModulePayload::AuthVerify(_)) => {
-                                    let reply = ContainerForEngine {
-                                        version: 2,
-                                        auth_token: conn.auth_token.clone(),
-                                        module_name: conn.config.module_name.clone(),
-                                        module_instance_uuid7: conn.instance_uuid7.clone(),
-                                        payload: Some(EnginePayload::AuthVerify(AuthVerify {
-                                            cur_auth: conn.auth_token.clone(),
-                                        })),
-                                    };
-                                    send_container(&write, reply).await;
-                                }
-                                Some(ModulePayload::DatabaseQueryResult(res)) => {
-                                    // Peak viewer count across all channels.
-                                    let mut peak = 0i32;
-                                    if let Ok(json) =
-                                        serde_json::from_slice::<serde_json::Value>(&res.result_blob)
-                                    {
-                                        if let Some(channels) =
-                                            json.get("channels").and_then(|c| c.as_array())
-                                        {
-                                            for ch in channels {
-                                                if let Some(v) = ch
-                                                    .get("viewers")
-                                                    .and_then(|v| v.as_i64())
-                                                {
-                                                    peak = peak.max(v as i32);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    *viewers_shared.lock().unwrap() = peak;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        drop(r);
                 }
             }
         });

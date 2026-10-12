@@ -1039,30 +1039,54 @@ impl TrigramTable {
     }
 }
 
-/// External trigram tables are cached by path (they're read-only on disk; the
-/// file could be huge and we must not re-parse it on every message).
+/// External trigram tables are cached by *resolved* path (they're read-only on
+/// disk; the file could be huge and we must not re-parse it on every message).
+/// A load failure is cached as `None` too, so a bad path is read and reported
+/// only once instead of on every scored message.
 static EXTERNAL_TRIGRAMS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<TrigramTable>>>,
+    std::sync::Mutex<std::collections::HashMap<String, Option<std::sync::Arc<TrigramTable>>>>,
 > = std::sync::OnceLock::new();
 
+/// The user's home directory from `$HOME` (Unix) or `%USERPROFILE%` (Windows).
+fn home_dir() -> Option<String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| h.to_string_lossy().into_owned())
+        .filter(|h| !h.is_empty())
+}
+
+/// Expand a leading `~` or `~/` to the user's home directory. Paths without a
+/// leading tilde, or with no resolvable home directory, are returned unchanged.
+fn expand_home(path: &str) -> String {
+    if path == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
+}
+
 fn external_trigram_table(path: &str) -> Option<std::sync::Arc<TrigramTable>> {
+    let resolved = expand_home(path);
     let cache =
         EXTERNAL_TRIGRAMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut cache = cache.lock().unwrap();
-    if let Some(t) = cache.get(path) {
-        return Some(t.clone());
+    if let Some(entry) = cache.get(&resolved) {
+        return entry.clone();
     }
-    match TrigramTable::load(path) {
-        Ok(t) => {
-            let t = std::sync::Arc::new(t);
-            cache.insert(path.to_string(), t.clone());
-            Some(t)
-        }
+    let loaded = match TrigramTable::load(&resolved) {
+        Ok(t) => Some(std::sync::Arc::new(t)),
         Err(e) => {
-            eprintln!("[score-messages] failed to load trigram table {path}: {e}");
+            eprintln!("[score-messages] failed to load trigram table {resolved}: {e}");
             None
         }
-    }
+    };
+    cache.insert(resolved, loaded.clone());
+    loaded
 }
 
 /// Check B — Trigrams.
@@ -1509,6 +1533,46 @@ mod tests {
         // embedded (bugged) table, so a known word still scores.
         let (delta, _) = score_message("hello", &c);
         assert!(delta >= 3, "missing external table falls back to embedded");
+    }
+
+    #[test]
+    fn expand_home_applies_home_prefix() {
+        let expanded = expand_home("~/nonexistent.csv");
+        match home_dir() {
+            Some(home) => {
+                assert!(
+                    expanded.starts_with(&home),
+                    "expected home prefix in {expanded}"
+                );
+                assert!(expanded.ends_with("/nonexistent.csv"));
+            }
+            None => assert_eq!(expanded, "~/nonexistent.csv"),
+        }
+        // Non-tilde paths are untouched.
+        assert_eq!(expand_home("/tmp/table.csv"), "/tmp/table.csv");
+        assert_eq!(expand_home("table.csv"), "table.csv");
+    }
+
+    #[test]
+    fn failed_trigram_load_is_cached_once() {
+        let path = "/tmp/cockatiel_probe_trigram_missing_cache.json";
+        let _ = std::fs::remove_file(path);
+        assert!(external_trigram_table(path).is_none());
+        // Create the file AFTER the failed load: a cached failure must not be
+        // re-read from disk (so this still returns None).
+        std::fs::write(path, r#"["the"]"#).unwrap();
+        assert!(
+            external_trigram_table(path).is_none(),
+            "cached failure must not re-read the filesystem"
+        );
+        let _ = std::fs::remove_file(path);
+        // The cache records the failure as an explicit None entry.
+        let cache = EXTERNAL_TRIGRAMS.get().unwrap().lock().unwrap();
+        let recorded = cache.get(path).map(|v| v.is_none()).unwrap_or(false);
+        assert!(
+            recorded,
+            "cache should record the load failure under {path}"
+        );
     }
 
     #[test]

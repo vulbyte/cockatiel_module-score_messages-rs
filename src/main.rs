@@ -390,6 +390,12 @@ fn in_process_adjust(
     // Clamp the earned delta to the configured range, if enabled.
     delta = clamp_delta(config, delta);
 
+    // Clamping can collapse a delta to zero (e.g. a penalty hitting the clamp
+    // floor): that's a no-op, so skip the guaranteed zero-delta DB round-trip.
+    if delta == 0 {
+        return None;
+    }
+
     // Apply the real signed delta via the engine's
     // score-only virtual query (no ±1 clamp, no
     // rating-counter inflation, no cooldown).
@@ -906,6 +912,31 @@ mod tests {
         };
         let payload: serde_json::Value = serde_json::from_str(&q.sql).unwrap();
         assert_eq!(payload["delta"], 30);
+    }
+
+    #[test]
+    fn in_process_clamped_to_zero_emits_no_query() {
+        let chat = sample_chat("0189a0c1-1111-4222-8333-444455556666");
+        let mut config = capital_only_config();
+        // A lowercase-leading message scores -capital_penalty; with clamp_min 0
+        // it clamps to 0, which must not send a no-op adjust query.
+        config.capital_penalty = 50;
+        config.clamp_toggle = true;
+        config.clamp_min = 0;
+        config.clamp_max = 100;
+        let mut last_msg = HashMap::new();
+        let process = sample_process("hello there", Some(chat));
+        assert!(in_process_adjust(
+            "tok",
+            "score-messages",
+            "inst",
+            &process,
+            &config,
+            0,
+            &mut last_msg,
+            0.0,
+        )
+        .is_none());
     }
 
     fn jittered_delta(config: &Config, roll: f32) -> i32 {

@@ -156,6 +156,30 @@
       "sensitive": false
     },
     {
+      "key": "media_toggle",
+      "label": "Media Reward Toggle (chat extra)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "media_static_score",
+      "label": "Media Static Image Score (png/jpg/jpeg)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "media_gif_score",
+      "label": "Media Animated Score (gif/apng/webp)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "media_max",
+      "label": "Media Reward Cap (0 = uncapped)",
+      "list": false,
+      "sensitive": false
+    },
+    {
       "key": "max_chars",
       "label": "Max Chars (AC A ceiling)",
       "list": false,

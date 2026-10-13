@@ -17,7 +17,8 @@ delta to the user's score:
 | G. 32-char groupings | each 32-char group with no space, total capped at `grouping_max` | −20 each (max −40) |
 | H. Spam & gibberish | `spam_emoji_max`+ emoji, a symbol-ratio wall (morse), or a vowel-less long word | −100 per signal |
 
-Plus an optional chat-specific **emoji** bonus (+15, toggleable), the
+Plus optional chat-specific extras: an **emoji** bonus (+15, toggleable), a
+**media** reward (a static image → +30, an animated gif/apng/webp → +50), the
 time-based **frequency** anti-spam rule, and a **viewership multiplier** that
 scales the final delta by how small the current audience is.
 
@@ -29,6 +30,20 @@ scales the final delta by how small the current audience is.
 > +13. Exploitation is still punished harshly by Check H: emoji walls,
 > morse-code symbol walls, and gibberish keyboard mash all score deeply
 > negative.
+
+## Media reward
+
+Messages that contain a media file/URL earn points, so sharing art/clips is
+encouraged. Detection is case-insensitive and works on both URLs and bare
+filenames:
+
+- **Animated** (`.gif`, `.apng`, `.webp`) → `media_gif_score` (default **50**).
+- **Static** (`.png`, `.jpg`, `.jpeg`) → `media_static_score` (default **30**).
+
+A URL (`https://host/x.gif`, `...x.png?query=1`) and a bare filename
+(`photo.jpeg`, `cat.gif`) are both detected; a filename that is already part of
+a URL is not double-counted. Multiple items sum, capped by `media_max`
+(default `0` = uncapped). Set `media_toggle` to `false` to disable.
 
 ## External trigram table
 
@@ -136,6 +151,10 @@ has a `<check>_toggle` / `<check>_score` pair, and the scalar thresholds are:
 | `grouping_max` | 40 | Check G: upper bound on the total grouping penalty (per-group cost still applies) |
 | `space_ratio_pct` | 10 | Check E: spaces ÷ non-spaces (%) threshold for the reward |
 | `space_ratio_penalty` | −5 | Check E: points applied below the threshold — negative, so the else-branch *adds* +5 to short space-less messages (decoupled from the +25 reward) |
+| `media_toggle` | `true` | enable/disable the media reward |
+| `media_static_score` | 30 | media reward: points for a static image (png/jpg/jpeg) |
+| `media_gif_score` | 50 | media reward: points for an animated gif/apng/webp |
+| `media_max` | 0 | media reward: cap on the total bonus per message (0 = uncapped) |
 | `spam_score` | 100 | Check H: points per spam signal (emoji wall, morse/symbol wall, gibberish word) |
 | `spam_emoji_max` | 5 | Check H: emoji count above this triggers the emoji-spam signal |
 | `spam_symbol_ratio_pct` | 30 | Check H: % of non-space chars that are symbols (non-letter/non-emoji) that triggers the morse/symbol-wall signal |

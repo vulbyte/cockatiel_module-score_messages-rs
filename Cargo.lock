@@ -1279,6 +1279,7 @@ dependencies = [
  "futures-util",
  "plotters",
  "prost 0.14.4",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

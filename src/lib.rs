@@ -29,6 +29,10 @@
 //!                           symbol-ratio wall (morse), or a vowel-less
 //!                           long word. The counter to the positive bias.
 //!
+//! Plus chat-specific extras: an **emoji** bonus, a **media** reward (a
+//! static image → +30, an animated gif/apng/webp → +50), the time-based
+//! **frequency** anti-spam rule, and a **viewership multiplier**.
+//!
 //! The weights are tuned to bias scoring toward positive: lowercase is never
 //! penalised, short space-less messages are rewarded, and the pure rewards
 //! (emoji, trigrams, punctuation, leading capital) are the main driver of a
@@ -43,6 +47,7 @@
 //! The live module (`main.rs`) calls the same functions, so a tuning decision
 //! made against the probe is guaranteed to match production behaviour.
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// The game's letter body maximum. Checks A uses this as a ceiling.
@@ -101,6 +106,30 @@ fn default_interval() -> u32 {
     2
 }
 
+/// The media reward rule (chat-specific extra). A message that contains a
+/// media file/URL earns `static_score` for a static image or `gif_score` for an
+/// animated gif/apng/webp. `max` caps the TOTAL media bonus per message
+/// (0 = uncapped).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaRule {
+    pub toggle: bool,
+    pub static_score: i32,
+    pub gif_score: i32,
+    #[serde(default = "default_media_max")]
+    pub max: i32,
+}
+
+impl Default for MediaRule {
+    fn default() -> Self {
+        Self {
+            toggle: true,
+            static_score: default_media_static_score(),
+            gif_score: default_media_gif_score(),
+            max: default_media_max(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     // ── The seven AC letter checks ──────────────────────────────────────
@@ -145,6 +174,11 @@ pub struct Config {
     /// Reward messages that include an emoji (engagement signal).
     #[serde(default = "default_emoji")]
     pub emoji: Rule,
+    /// Reward messages that include a media file/URL: a static image
+    /// (`static_score`, default 30) or an animated gif/apng/webp
+    /// (`gif_score`, default 50). `max` caps the total bonus (0 = uncapped).
+    #[serde(default = "default_media")]
+    pub media: MediaRule,
     /// Check H: punish spammy messages — too many emojis, symbol-heavy
     /// (morse-like) text, or long vowel-less (gibberish) words.
     #[serde(default = "default_spam")]
@@ -289,6 +323,18 @@ fn default_emoji() -> Rule {
         score: 15,
     }
 }
+fn default_media() -> MediaRule {
+    MediaRule::default()
+}
+pub fn default_media_static_score() -> i32 {
+    30
+}
+pub fn default_media_gif_score() -> i32 {
+    50
+}
+pub fn default_media_max() -> i32 {
+    0
+}
 fn default_spam() -> Rule {
     Rule {
         toggle: true,
@@ -394,6 +440,7 @@ pub fn default_config() -> Config {
         grouping: default_grouping(),
         grouping_max: default_grouping_max(),
         emoji: default_emoji(),
+        media: default_media(),
         spam: default_spam(),
         spam_emoji_max: default_spam_emoji_max(),
         spam_symbol_ratio_pct: default_spam_symbol_ratio_pct(),
@@ -526,6 +573,18 @@ pub fn apply_flat_overlay(
     apply_rule!(run_on, "run_on");
     apply_rule!(grouping, "grouping");
     apply_rule!(emoji, "emoji");
+    if let Some(t) = parse_toggle(ms.get("media_toggle")) {
+        cfg.media.toggle = t;
+    }
+    if let Some(v) = parse_score(ms.get("media_static_score")) {
+        cfg.media.static_score = v as i32;
+    }
+    if let Some(v) = parse_score(ms.get("media_gif_score")) {
+        cfg.media.gif_score = v as i32;
+    }
+    if let Some(v) = parse_i64(ms.get("media_max")) {
+        cfg.media.max = v as i32;
+    }
     apply_rule!(spam, "spam");
     if let Some(v) = parse_usize(ms.get("spam_emoji_max")) {
         cfg.spam_emoji_max = v as i32;
@@ -663,6 +722,26 @@ pub fn flat_map_for_write(
     put_rule!(run_on, "run_on");
     put_rule!(grouping, "grouping");
     put_rule!(emoji, "emoji");
+    out.insert(
+        "media_toggle".to_string(),
+        serde_json::Value::Bool(parse_toggle(ms.get("media_toggle")).unwrap_or(cfg.media.toggle)),
+    );
+    out.insert(
+        "media_static_score".to_string(),
+        serde_json::json!(parse_score(ms.get("media_static_score"))
+            .map(|s| s as i32)
+            .unwrap_or(cfg.media.static_score)),
+    );
+    out.insert(
+        "media_gif_score".to_string(),
+        serde_json::json!(parse_score(ms.get("media_gif_score"))
+            .map(|s| s as i32)
+            .unwrap_or(cfg.media.gif_score)),
+    );
+    out.insert(
+        "media_max".to_string(),
+        serde_json::json!(parse_i64(ms.get("media_max")).unwrap_or(cfg.media.max as i64)),
+    );
     put_rule!(spam, "spam");
     out.insert(
         "spam_emoji_max".to_string(),
@@ -804,6 +883,70 @@ pub fn is_emoji(c: char) -> bool {
         || (0x2600..=0x27BF).contains(&cp)
         || (0xFE00..=0xFE0F).contains(&cp)
         || (0x1F000..=0x1F0FF).contains(&cp)
+}
+
+/// Case-insensitive image/gif URL pattern (mirrors term-chat's regex). Matches
+/// up to the image extension, so a trailing query string (`...x.png?a=b`) is
+/// ignored and the extension still classifies the token.
+fn media_url_regex() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)https?://[^\s<>]+?\.(?:png|apng|jpe?g|gif|webp)")
+            .expect("media URL regex must compile")
+    })
+}
+
+/// Case-insensitive bare-filename pattern (`photo.jpeg`, `cat.gif`), anchored by
+/// word boundaries so it does not fire on e.g. `photo.pngx`.
+fn media_file_regex() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\b[\w\-]+\.(?:png|apng|jpe?g|gif|webp)\b")
+            .expect("media filename regex must compile")
+    })
+}
+
+/// The lowercased extension of a matched media token (after its last `.`).
+fn media_extension(token: &str) -> String {
+    token.rsplit('.').next().unwrap_or("").to_ascii_lowercase()
+}
+
+/// The reward for one media token: animated formats (`gif`/`apng`/`webp`) earn
+/// `gif_score`, static formats (`png`/`jpg`/`jpeg`) earn `static_score`.
+fn media_points(ext: &str, cfg: &Config) -> i32 {
+    match ext {
+        "gif" | "apng" | "webp" => cfg.media.gif_score,
+        _ => cfg.media.static_score,
+    }
+}
+
+/// Media reward (chat-specific extra). Sum the static/animated bonuses for every
+/// image/gif URL or bare filename in the message. A filename already covered by
+/// a URL match is not double-counted. When `media.max > 0` the total is capped.
+fn media_bonus(input: &str, cfg: &Config) -> i32 {
+    if !cfg.media.toggle {
+        return 0;
+    }
+    let mut total = 0i32;
+    let mut url_spans: Vec<(usize, usize)> = Vec::new();
+    for m in media_url_regex().find_iter(input) {
+        url_spans.push((m.start(), m.end()));
+        total += media_points(&media_extension(m.as_str()), cfg);
+    }
+    for m in media_file_regex().find_iter(input) {
+        // Skip filenames that are part of a URL match (already counted).
+        let overlaps = url_spans
+            .iter()
+            .any(|(s, e)| m.start() < *e && m.end() > *s);
+        if overlaps {
+            continue;
+        }
+        total += media_points(&media_extension(m.as_str()), cfg);
+    }
+    if cfg.media.max > 0 {
+        total = total.min(cfg.media.max);
+    }
+    total
 }
 
 /// Check A — Punctuation.
@@ -1380,6 +1523,13 @@ pub fn score_message(message: &str, cfg: &Config) -> (i32, Vec<String>) {
         delta += cfg.emoji.score;
         notes.push("emoji".into());
     }
+    if cfg.media.toggle {
+        let d = media_bonus(message, cfg);
+        if d != 0 {
+            delta += d;
+            notes.push("media".into());
+        }
+    }
     if cfg.spam.toggle {
         let d = check_h(message, cfg);
         if d != 0 {
@@ -1454,6 +1604,7 @@ mod tests {
         ] {
             r.toggle = false;
         }
+        c.media.toggle = false;
         c
     }
 
@@ -1776,6 +1927,158 @@ mod tests {
         let (delta, notes) = score_message("nice stream 👍", &c);
         assert_eq!(delta, 15);
         assert!(notes.contains(&"emoji".to_string()));
+    }
+
+    #[test]
+    fn media_rewards_animated_gif_url() {
+        let mut c = all_off();
+        c.media.toggle = true;
+        let (delta, notes) = score_message("look https://example.com/cat.gif", &c);
+        assert_eq!(delta, 50);
+        assert!(notes.contains(&"media".to_string()));
+        // Uppercase extension + query string (case-insensitive, query ignored).
+        let (delta, _) = score_message("https://cdn.example.com/x.GIF?ex=1&is=2", &c);
+        assert_eq!(delta, 50);
+        // apng / webp are animated too.
+        let (delta, _) = score_message("dance https://example.com/x.apng", &c);
+        assert_eq!(delta, 50);
+        let (delta, _) = score_message("dance https://example.com/x.webp", &c);
+        assert_eq!(delta, 50);
+    }
+
+    #[test]
+    fn media_rewards_static_image_url() {
+        let mut c = all_off();
+        c.media.toggle = true;
+        let (delta, notes) = score_message("pic https://example.com/x.png", &c);
+        assert_eq!(delta, 30);
+        assert!(notes.contains(&"media".to_string()));
+        let (delta, _) = score_message("pic https://example.com/x.jpg", &c);
+        assert_eq!(delta, 30);
+        let (delta, _) = score_message("pic https://example.com/x.jpeg", &c);
+        assert_eq!(delta, 30);
+    }
+
+    #[test]
+    fn media_rewards_bare_filename() {
+        let mut c = all_off();
+        c.media.toggle = true;
+        let (delta, notes) = score_message("here is my photo.jpeg", &c);
+        assert_eq!(delta, 30);
+        assert!(notes.contains(&"media".to_string()));
+        // A bare gif filename is animated.
+        let (delta, _) = score_message("check cat.gif out", &c);
+        assert_eq!(delta, 50);
+    }
+
+    #[test]
+    fn media_plain_message_has_no_bonus() {
+        let mut c = all_off();
+        c.media.toggle = true;
+        let (delta, notes) = score_message("hello there, how are you", &c);
+        assert_eq!(delta, 0);
+        assert!(!notes.contains(&"media".to_string()));
+        // A URL whose path is not an image/gif is not a media reward.
+        let (delta, _) = score_message("watch https://example.com/video", &c);
+        assert_eq!(delta, 0);
+        // A near-miss extension does not fire.
+        let (delta, _) = score_message("see photo.pngx here", &c);
+        assert_eq!(delta, 0);
+    }
+
+    #[test]
+    fn media_multiple_items_and_cap() {
+        let mut c = all_off();
+        c.media.toggle = true;
+        // A static + an animated URL: 30 + 50 = 80, uncapped by default.
+        let (delta, _) = score_message("a https://x/a.png and b https://x/b.gif", &c);
+        assert_eq!(delta, 80);
+        // With a cap the total media bonus is bounded.
+        c.media.max = 40;
+        let (delta, _) = score_message("a https://x/a.png and b https://x/b.gif", &c);
+        assert_eq!(delta, 40);
+        // The URL's own filename is not double-counted.
+        let (delta, _) = score_message("https://x/only.png", &c);
+        assert_eq!(delta, 30);
+    }
+
+    #[test]
+    fn media_toggle_off_disables_bonus() {
+        let mut c = all_off();
+        c.media.toggle = false;
+        let (delta, _) = score_message("https://x/a.gif", &c);
+        assert_eq!(delta, 0);
+    }
+
+    #[test]
+    fn media_overlay_round_trips() {
+        let cfg = default_config();
+        let written = flat_map_for_write(&cfg, &serde_json::json!({}), &serde_json::Map::new());
+        assert_eq!(written["media_toggle"], true);
+        assert_eq!(written["media_static_score"], 30);
+        assert_eq!(written["media_gif_score"], 50);
+        assert_eq!(written["media_max"], 0);
+        let mut overridden = written.clone();
+        overridden.insert("media_toggle".to_string(), serde_json::json!(false));
+        overridden.insert("media_static_score".to_string(), serde_json::json!(12));
+        overridden.insert("media_gif_score".to_string(), serde_json::json!(22));
+        overridden.insert("media_max".to_string(), serde_json::json!(99));
+        let restored = apply_flat_overlay(default_config(), &overridden);
+        assert!(!restored.media.toggle);
+        assert_eq!(restored.media.static_score, 12);
+        assert_eq!(restored.media.gif_score, 22);
+        assert_eq!(restored.media.max, 99);
+    }
+
+    /// PART B — score length matrix. Scores the same pure `score_message` path
+    /// the module uses (jitter is a separate, post-scoring step, so the deltas
+    /// here are deterministic) across message lengths and prints the delta at
+    /// each length so the behaviour is documented. Asserts nothing panics, that
+    /// short one-word chat is never absurdly negative, and that a well-formed
+    /// multi-sentence message nets positive.
+    #[test]
+    fn score_length_matrix() {
+        let cfg = default_config();
+
+        // 1-word messages: modern chat shorthand.
+        for w in ["pog", "yes", "no", "lol", "gg"] {
+            let (delta, notes) = score_message(w, &cfg);
+            println!("1-word   {w:>4} -> delta={delta:>4} notes={notes:?}");
+            assert!(
+                delta >= -10,
+                "short message {w:?} must not be absurdly negative, got {delta}"
+            );
+        }
+
+        // Semi-sentences.
+        for s in ["yeh i guess", "nah not really", "idk man"] {
+            let (delta, notes) = score_message(s, &cfg);
+            println!("semi     {s:>14} -> delta={delta:>4} notes={notes:?}");
+            assert!(delta >= -10, "semi-sentence {s:?} got {delta}");
+        }
+
+        // One full sentence.
+        let sentence = "yeh, i really think that's a great idea!";
+        let (delta, notes) = score_message(sentence, &cfg);
+        println!("1 sentence          -> delta={delta:>4} notes={notes:?}");
+
+        // 1..=50 sentences: a well-formed sentence repeated N times.
+        let unit = "I really enjoyed the stream today and the community here is fantastic.";
+        for n in 1..=50usize {
+            let msg = std::iter::repeat_n(unit, n).collect::<Vec<_>>().join(" ");
+            let (delta, notes) = score_message(&msg, &cfg);
+            println!(
+                "{n:>2} sentence(s) ({} chars) -> delta={delta:>6} notes={notes:?}",
+                msg.chars().count()
+            );
+            assert!(delta >= -100, "length {n} must not be absurdly negative");
+            if n >= 2 {
+                assert!(
+                    delta > 0,
+                    "a well-formed {n}-sentence message must net positive, got {delta}"
+                );
+            }
+        }
     }
 
     #[test]

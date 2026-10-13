@@ -624,6 +624,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     *viewers_shared.lock().unwrap() = peak;
                                 }
+                                Some(ModulePayload::Shutdown(_)) => {
+                                    info!("Engine requested shutdown — exiting");
+                                    std::process::exit(0);
+                                }
                                 _ => {}
                             }
                         }

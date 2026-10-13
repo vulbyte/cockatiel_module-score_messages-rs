@@ -13,8 +13,8 @@ delta to the user's score:
 | C. Leading capital | first non-space char is a capital (+30) or not (0) | 30 |
 | D. Repeating chars | any letter repeated 3+ times sequentially | −50 |
 | E. Space ratio | spaces ≥ 10% of non-spaces (+25) or not (+5) | 25 |
-| F. Run-on sentence | 75+ chars without punctuation after a punct mark | −150 |
-| G. 32-char groupings | each 32-char group with no space | −20 each |
+| F. Run-on sentence | 120+ chars without punctuation after a punct mark | −60 |
+| G. 32-char groupings | each 32-char group with no space, total capped at `grouping_max` | −20 each (max −40) |
 | H. Spam & gibberish | `spam_emoji_max`+ emoji, a symbol-ratio wall (morse), or a vowel-less long word | −100 per signal |
 
 Plus an optional chat-specific **emoji** bonus (+15, toggleable), the
@@ -130,9 +130,10 @@ has a `<check>_toggle` / `<check>_score` pair, and the scalar thresholds are:
 | `punct_capital_penalty` | 0 | Check A: −pts per punctuation NOT followed by a capital |
 | `capital_penalty` | 0 | Check C: −pts when the leading non-space char isn't a capital |
 | `repeating_threshold` | 3 | Check D: sequential repeats of a letter needed to trigger the penalty |
-| `run_on_chars` | 75 | Check F: no-punctuation run length that triggers the run-on penalty |
+| `run_on_chars` | 120 | Check F: no-punctuation run length that triggers the run-on penalty |
 | `run_on_window` | 76 | Check F: the scan only evaluates while more than this many chars remain |
 | `grouping_size` | 32 | Check G: the space-grouping window |
+| `grouping_max` | 40 | Check G: upper bound on the total grouping penalty (per-group cost still applies) |
 | `space_ratio_pct` | 10 | Check E: spaces ÷ non-spaces (%) threshold for the reward |
 | `space_ratio_penalty` | −5 | Check E: points applied below the threshold — negative, so the else-branch *adds* +5 to short space-less messages (decoupled from the +25 reward) |
 | `spam_score` | 100 | Check H: points per spam signal (emoji wall, morse/symbol wall, gibberish word) |

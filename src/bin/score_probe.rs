@@ -147,10 +147,11 @@ const CORPUS: &[CorpusEntry] = &[
     Entry("space_ratio", "ccccccccccccccccccccccccccccc"),
     Entry("space_ratio", "ddddddddddddddddddddddddddddd"),
     Entry("space_ratio", "eeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
-    // Check F — run-on: 75+ chars without punctuation after a punct mark, -150.
-    Entry("run_on", "That was amazing. aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-    Entry("run_on", "Great stream. bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-    // Check G — 32-char groupings: each 32-char group without a space, -20.
+    // Check F — run-on: 120+ chars without punctuation after a punct mark, -60.
+    Entry("run_on", "That was amazing. aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    Entry("run_on", "Great stream. bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    // Check G — 32-char groupings: each 32-char group without a space, -20,
+    // capped at grouping_max (40) in total.
     Entry("grouping", "thisisareallylongmessagewithnospaceswhatsoeverintheentirething"),
     Entry("grouping", "cantbelieveiwrotethiswithnospacesatallthatscrazy"),
     Entry("grouping", "nospacesinthelongmessageatyalljustonegiantrunonsentence"),

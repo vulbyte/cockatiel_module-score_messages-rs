@@ -21,9 +21,10 @@
 //!                           else +5 (the penalty is a negative number, so a
 //!                           space-less short message is *rewarded* not
 //!                           punished — modern chat is built on "gg", "lol").
-//!   F. Run-on sentence    — −150 if a run of 75+ chars has no punctuation
+//!   F. Run-on sentence    — −60 if a run of 120+ chars has no punctuation
 //!                           after a punctuation mark.
-//!   G. 32-char groupings  — −20 per 32-char group that contains no space.
+//!   G. 32-char groupings  — −20 per 32-char group that contains no space,
+//!                           with the total bounded by `grouping_max` (40).
 //!   H. Spam & gibberish   — −100 per signal: `spam_emoji_max`+ emoji, a
 //!                           symbol-ratio wall (morse), or a vowel-less
 //!                           long word. The counter to the positive bias.
@@ -47,11 +48,17 @@ use serde::{Deserialize, Serialize};
 /// The game's letter body maximum. Checks A uses this as a ceiling.
 const MAX_CHARS: usize = 192;
 
-/// The run-on check's no-punctuation threshold (chars).
-pub const RUN_ON_CHARS: i32 = 75;
+/// The run-on check's no-punctuation threshold (chars). Raised from the game's
+/// 75 so only genuinely unreadable walls (not ordinary long sentences) fire.
+pub const RUN_ON_CHARS: i32 = 120;
 
 /// The 32-char space-grouping window.
 pub const GROUPING_SIZE: usize = 32;
+
+/// Check G: the most a single message may lose to the grouping penalty. The
+/// per-group cost still applies, but the total is bounded so a long, mostly
+/// well-spaced message is never nuked by many empty groups.
+pub const GROUPING_MAX: i32 = 40;
 
 /// The space-ratio threshold (spaces ÷ non-spaces, ×100). Tuned to 10% so a
 /// message with any spaces earns the reward.
@@ -129,6 +136,11 @@ pub struct Config {
     /// Check G: 32-char space groupings.
     #[serde(default = "default_grouping")]
     pub grouping: Rule,
+    /// Check G: the total grouping penalty is bounded to at most this many
+    /// points (the per-group cost still applies below the cap), so a very long
+    /// message is not wiped out by an unbounded number of empty groups.
+    #[serde(default = "default_grouping_max")]
+    pub grouping_max: i32,
     // ── Chat-specific extras (not part of the AC algorithm) ────────────
     /// Reward messages that include an emoji (engagement signal).
     #[serde(default = "default_emoji")]
@@ -262,7 +274,7 @@ fn default_space_ratio() -> Rule {
 fn default_run_on() -> Rule {
     Rule {
         toggle: true,
-        score: 150,
+        score: 60,
     }
 }
 fn default_grouping() -> Rule {
@@ -316,6 +328,9 @@ pub fn default_run_on_chars() -> i32 {
 }
 pub fn default_grouping_size() -> usize {
     GROUPING_SIZE
+}
+pub fn default_grouping_max() -> i32 {
+    GROUPING_MAX
 }
 pub fn default_max_chars() -> usize {
     MAX_CHARS
@@ -377,6 +392,7 @@ pub fn default_config() -> Config {
         space_ratio_penalty: default_space_ratio_penalty(),
         run_on: default_run_on(),
         grouping: default_grouping(),
+        grouping_max: default_grouping_max(),
         emoji: default_emoji(),
         spam: default_spam(),
         spam_emoji_max: default_spam_emoji_max(),
@@ -545,6 +561,9 @@ pub fn apply_flat_overlay(
     if let Some(v) = parse_usize(ms.get("grouping_size")) {
         cfg.grouping_size = v;
     }
+    if let Some(v) = parse_i64(ms.get("grouping_max")) {
+        cfg.grouping_max = v as i32;
+    }
     if let Some(v) = parse_i64(ms.get("space_ratio_pct")) {
         cfg.space_ratio_pct = v as i32;
     }
@@ -708,6 +727,7 @@ pub fn flat_map_for_write(
     }
     put_scalar!("run_on_chars", parse_usize, cfg.run_on_chars as usize);
     put_scalar!("grouping_size", parse_usize, cfg.grouping_size);
+    put_scalar!("grouping_max", parse_i64, cfg.grouping_max as i64);
     put_scalar!("space_ratio_pct", parse_i64, cfg.space_ratio_pct as i64);
     put_scalar!("max_chars", parse_usize, cfg.max_chars);
     put_scalar!(
@@ -1197,8 +1217,9 @@ fn check_e(input: &str, cfg: &Config) -> i32 {
     }
 }
 
-/// Check F — Run-on sentence. −150 if, after a punctuation mark, a run of
-/// `run_on_chars`+ sequential chars has no punctuation.
+/// Check F — Run-on sentence. −`run_on.score` (default 60) if, after a
+/// punctuation mark, a run of `run_on_chars`+ (default 120) sequential chars has
+/// no punctuation.
 fn check_f(input: &str, cfg: &Config) -> i32 {
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
@@ -1224,7 +1245,9 @@ fn check_f(input: &str, cfg: &Config) -> i32 {
     0
 }
 
-/// Check G — 32-char space groupings. −20 per 32-char group with no space.
+/// Check G — 32-char space groupings. −`grouping.score` per 32-char group with
+/// no space, with the total bounded by `grouping_max` (default 40) so a long
+/// message is never wiped out by an unbounded number of empty groups.
 fn check_g(input: &str, cfg: &Config) -> i32 {
     let trimmed: Vec<char> = input.trim_matches([' ', '\t']).chars().collect();
     let total = trimmed.len();
@@ -1237,7 +1260,7 @@ fn check_g(input: &str, cfg: &Config) -> i32 {
             score -= cfg.grouping.score;
         }
     }
-    score
+    score.max(-cfg.grouping_max.max(0))
 }
 
 /// Check H — Spam & gibberish (chat-specific anti-exploit rule).
@@ -1615,9 +1638,15 @@ mod tests {
     fn check_f_punishes_run_on() {
         let mut c = all_off();
         c.run_on.toggle = true;
-        let long = "The stream was great. ".to_string() + &"a".repeat(80);
+        // An 80-char run is below the softened 120-char threshold: no penalty.
+        let soft = "The stream was great. ".to_string() + &"a".repeat(80);
+        let (delta, notes) = score_message(&soft, &c);
+        assert_eq!(delta, 0, "an 80-char run should no longer be a run-on");
+        assert!(!notes.contains(&"run_on".to_string()));
+        // A genuine 130-char wall still fires, but at the softer −60.
+        let long = "The stream was great. ".to_string() + &"a".repeat(130);
         let (delta, notes) = score_message(&long, &c);
-        assert_eq!(delta, -150);
+        assert_eq!(delta, -60);
         assert!(notes.contains(&"run_on".to_string()));
     }
 
@@ -1646,6 +1675,101 @@ mod tests {
     }
 
     #[test]
+    fn check_g_penalty_is_capped_for_long_walls() {
+        let mut c = all_off();
+        c.grouping.toggle = true;
+        // 256 spaceless chars = 8 groups → −160 uncapped, bounded to −40.
+        let wall = "a".repeat(256);
+        let (delta, notes) = score_message(&wall, &c);
+        assert_eq!(delta, -c.grouping_max, "grouping penalty must hit the cap");
+        assert!(notes.contains(&"grouping".to_string()));
+        // Two empty groups (−40) still sit exactly at the cap.
+        let wall = "a".repeat(64);
+        let (delta, _) = score_message(&wall, &c);
+        assert_eq!(delta, -40);
+        // One empty group is below the cap and unchanged.
+        let wall = "a".repeat(33);
+        let (delta, _) = score_message(&wall, &c);
+        assert_eq!(delta, -20);
+    }
+
+    /// The pre-rebalance defaults, used to report before/after deltas. The
+    /// per-group cost and cap were equivalent to no cap at these sizes.
+    fn pre_rebalance_defaults() -> Config {
+        let mut c = default_config();
+        c.run_on_chars = 75;
+        c.run_on.score = 150;
+        c.grouping_max = i32::MAX;
+        c
+    }
+
+    #[test]
+    fn long_wellformed_sentence_is_positive_under_defaults() {
+        // ~30 words, capitalized, commas/period, normal spaces. The long
+        // second sentence is a ~100-char punctuation-free run, so it trips the
+        // old 75-char run-on check but not the softened 120-char one.
+        let msg = "Hello everyone. I just wanted to say that the stream has been absolutely incredible tonight, and I really appreciate it. Thanks for all the hard work you do.";
+        let n = msg.chars().count();
+        assert!((150..=200).contains(&n), "test sentence is {n} chars");
+
+        let (before, before_notes) = score_message(msg, &pre_rebalance_defaults());
+        let (after, notes) = score_message(msg, &default_config());
+        println!(
+            "well-formed ({n} chars): before={before} after={after} before_notes={before_notes:?} after_notes={notes:?}"
+        );
+        assert!(
+            after > 0,
+            "a well-formed long sentence must score positive, got {after}"
+        );
+        assert!(
+            before <= after,
+            "the rebalance must not lower a good message"
+        );
+        assert!(before_notes.contains(&"run_on".to_string()));
+        assert!(!notes.contains(&"run_on".to_string()));
+    }
+
+    #[test]
+    fn long_spaceless_wall_is_not_absurdly_negative() {
+        // 200-char lowercase wall with no spaces and no punctuation.
+        let wall = "thestreamisabsolutelyonfiretonightandihavenoideawhatiamdoingbutheregoesnothingatallthisisjustonegiantwalloftextwithnospaceswhatsoeveranditkeepgoingandgoinguntilwehitaroundtwohundredcharacterslong";
+        let n = wall.chars().count();
+        assert!((190..=210).contains(&n), "test wall is {n} chars");
+
+        let (before, _) = score_message(wall, &pre_rebalance_defaults());
+        let (after, _) = score_message(wall, &default_config());
+        println!("spaceless wall ({n} chars): before={before} after={after}");
+        assert!(
+            after >= -100,
+            "a wall must not be absurdly negative, got {after}"
+        );
+        assert!(
+            clamp_delta(&default_config(), after) <= 0,
+            "the clamped wall delta must stay non-positive, got {after}"
+        );
+        assert!(before <= after, "the rebalance must soften the wall");
+    }
+
+    #[test]
+    fn single_130_char_run_is_handled_sanely() {
+        let mut c = all_off();
+        c.run_on.toggle = true;
+        // A single 130-char punctuation-free run (pattern avoids check D/G).
+        let run = "abcdefghijklmnopqrstuvwxyz".repeat(5);
+        let msg = format!("Hi. {run}");
+        assert_eq!(run.chars().count(), 130);
+
+        let mut old = c.clone();
+        old.run_on_chars = 75;
+        old.run_on.score = 150;
+        let (before, _) = score_message(&msg, &old);
+        let (after, _) = score_message(&msg, &c);
+        println!("130-char run: before={before} after={after}");
+        assert_eq!(before, -150);
+        assert_eq!(after, -60);
+    }
+
+    #[test]
     fn emoji_is_optional_extra() {
         let mut c = all_off();
         c.emoji.toggle = true;
@@ -1659,8 +1783,9 @@ mod tests {
         let cfg = default_config();
         let root = serde_json::json!({});
         let written = flat_map_for_write(&cfg, &root, &serde_json::Map::new());
-        assert_eq!(written["run_on_chars"], 75);
+        assert_eq!(written["run_on_chars"], 120);
         assert_eq!(written["grouping_size"], 32);
+        assert_eq!(written["grouping_max"], 40);
         assert_eq!(written["space_ratio_pct"], 10);
         assert_eq!(written["max_chars"], 192);
         assert_eq!(written["punct_capital_bonus"], 20);
@@ -1675,8 +1800,9 @@ mod tests {
         assert_eq!(written["viewership_multiplier_max"], 5.0);
         assert_eq!(written["viewership_poll_secs"], 30);
         let restored = apply_flat_overlay(default_config(), &written);
-        assert_eq!(restored.run_on_chars, 75);
+        assert_eq!(restored.run_on_chars, 120);
         assert_eq!(restored.grouping_size, 32);
+        assert_eq!(restored.grouping_max, 40);
         assert_eq!(restored.space_ratio_pct, 10);
         assert_eq!(restored.max_chars, 192);
         assert_eq!(restored.punct_capital_bonus, 20);

@@ -764,6 +764,7 @@ mod tests {
         }
         config.capital.toggle = true;
         config.frequency.toggle = false;
+        config.base.toggle = false;
         config
     }
 

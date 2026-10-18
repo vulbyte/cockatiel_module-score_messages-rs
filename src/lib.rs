@@ -199,6 +199,13 @@ pub struct Config {
     /// Punish posting again too soon after a user's last message.
     #[serde(default)]
     pub frequency: FrequencyRule,
+    /// Reward PARTICIPATION: a flat bonus granted to every non-empty message,
+    /// so a short "gg"/"lol" is worth more relative to a long message. This is
+    /// the rebalance that lifts small messages without touching long ones (which
+    /// already earn plenty from the length-sensitive rules). `score` = 0 or
+    /// `toggle` off disables it.
+    #[serde(default = "default_base")]
+    pub base: Rule,
     // ── Viewership multiplier ───────────────────────────────────────────
     /// Scale the score delta by a viewership factor: small streams reward
     /// interaction more (multiplier = max_viewers / viewers, clamped to
@@ -323,6 +330,12 @@ fn default_emoji() -> Rule {
         score: 15,
     }
 }
+fn default_base() -> Rule {
+    Rule {
+        toggle: true,
+        score: 20,
+    }
+}
 fn default_media() -> MediaRule {
     MediaRule::default()
 }
@@ -440,6 +453,7 @@ pub fn default_config() -> Config {
         grouping: default_grouping(),
         grouping_max: default_grouping_max(),
         emoji: default_emoji(),
+        base: default_base(),
         media: default_media(),
         spam: default_spam(),
         spam_emoji_max: default_spam_emoji_max(),
@@ -573,6 +587,7 @@ pub fn apply_flat_overlay(
     apply_rule!(run_on, "run_on");
     apply_rule!(grouping, "grouping");
     apply_rule!(emoji, "emoji");
+    apply_rule!(base, "base");
     if let Some(t) = parse_toggle(ms.get("media_toggle")) {
         cfg.media.toggle = t;
     }
@@ -722,6 +737,7 @@ pub fn flat_map_for_write(
     put_rule!(run_on, "run_on");
     put_rule!(grouping, "grouping");
     put_rule!(emoji, "emoji");
+    put_rule!(base, "base");
     out.insert(
         "media_toggle".to_string(),
         serde_json::Value::Bool(parse_toggle(ms.get("media_toggle")).unwrap_or(cfg.media.toggle)),
@@ -1258,7 +1274,12 @@ fn external_trigram_table(path: &str) -> Option<std::sync::Arc<TrigramTable>> {
 /// embedded game table by default (with the NA/AU section-scan bug), or a
 /// user-supplied external table when `trigram_table_path` is set.
 fn check_b(input: &str, cfg: &Config) -> i32 {
-    let mut padded = input.to_string();
+    // Score at most `max_chars` characters: a longer message is TRUNCATED to a
+    // `max_chars`-long one, so text volume can't out-earn a normal message. (The
+    // old code only padded SHORT messages and let long ones through whole, so a
+    // wall earned `len × trigram_score` — hundreds of times a normal message,
+    // which is what inflated the outlier scores.)
+    let mut padded: String = input.chars().take(cfg.max_chars).collect();
     padded.push_str(&" ".repeat(cfg.max_chars.saturating_sub(padded.chars().count())));
     let all_trigrams = get_all_trigrams(&padded);
 
@@ -1537,6 +1558,17 @@ pub fn score_message(message: &str, cfg: &Config) -> (i32, Vec<String>) {
             notes.push("spam".into());
         }
     }
+    // Participation base, applied LAST and only to a message that is NOT net
+    // penalized: it lifts short/good messages toward longer ones, but never
+    // softens a spam/penalty (a penalized message keeps its full penalty).
+    if cfg.base.toggle
+        && cfg.base.score != 0
+        && delta >= 0
+        && message.trim().chars().next().is_some()
+    {
+        delta += cfg.base.score;
+        notes.push("base".into());
+    }
     (delta, notes)
 }
 
@@ -1605,7 +1637,53 @@ mod tests {
             r.toggle = false;
         }
         c.media.toggle = false;
+        c.base.toggle = false;
         c
+    }
+
+    #[test]
+    fn base_lifts_short_messages_without_softening_penalties() {
+        // A plain message with no rule hits still earns the participation base.
+        let mut c = all_off();
+        c.base.toggle = true;
+        let (delta, notes) = score_message("hello", &c);
+        assert_eq!(delta, 20);
+        assert!(notes.contains(&"base".to_string()));
+
+        // A PENALIZED message keeps its FULL penalty — the base never softens it.
+        c.repeating.toggle = true;
+        let (delta, notes) = score_message("aaaaaaa", &c);
+        assert_eq!(delta, -50, "the base must not offset a penalty");
+        assert!(!notes.contains(&"base".to_string()));
+
+        // A gain gets the base on top of the rule's reward.
+        c.repeating.toggle = false;
+        c.capital.toggle = true;
+        let (delta, _) = score_message("Hello", &c);
+        assert_eq!(delta, 20 + 30);
+    }
+
+    #[test]
+    fn base_off_or_zero_is_a_no_op() {
+        let mut c = all_off();
+        c.base.toggle = false;
+        assert_eq!(score_message("hello", &c).0, 0);
+        c.base.toggle = true;
+        c.base.score = 0;
+        assert_eq!(score_message("hello", &c).0, 0);
+    }
+
+    #[test]
+    fn trigram_is_capped_at_max_chars() {
+        // A message longer than `max_chars` scores the SAME as one exactly
+        // `max_chars` long — text volume can no longer out-earn a normal
+        // message (the bug that inflated long-message posters).
+        let mut c = all_off();
+        c.trigram.toggle = true;
+        let capped = "a".repeat(c.max_chars);
+        let wall = "a".repeat(c.max_chars * 5);
+        assert_eq!(check_b(&capped, &c), check_b(&wall, &c));
+        assert_eq!(check_b(&wall, &c), check_b(&capped, &c));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 use cockatiel_client::proto::container_for_engine::Payload as EnginePayload;
@@ -412,7 +412,9 @@ fn in_process_adjust(
             params: vec![],
         })),
     };
-    warn!(
+    // Per-message trace: `debug` (dropped at the module's INFO level) so a
+    // scored message is not a synchronous write on the hot path.
+    debug!(
         "[score] uuid={} delta={} notes={:?} ({} user={})",
         process.message_uuid7, delta, notes, query_id, user_id
     );
@@ -421,10 +423,17 @@ fn in_process_adjust(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Non-blocking stderr: logs go through a background writer thread with a
+    // bounded buffer (dropping on overflow) instead of a synchronous write from
+    // the calling task. A synchronous `warn!` on the message hot path could
+    // block the read loop when the stderr pipe back-pressures (e.g. while the
+    // supervisor/TUI log reader catches up at startup), stalling the module's
+    // acks. The guard must live for the whole process, so it is held here.
+    let (non_blocking, _log_guard) = tracing_appender::non_blocking(std::io::stderr());
     let subscriber = FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
         .with_ansi(false)
-        .with_writer(std::io::stderr)
+        .with_writer(non_blocking)
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
